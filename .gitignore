@@ -22,6 +22,7 @@ cert.pem
 Thumbs.db
 desktop.ini
 tmp_*
+*.txt
 
 # ==== 开发专用（只发布游戏本体：代码 + 模型 + README + 截图） ====
 AGENTS.md

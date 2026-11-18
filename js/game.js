@@ -125,11 +125,18 @@ export class Game {
         desc: '野地检查点拉力 · 推荐越野车 · 首胜 +60💎', color: 0x88ff44 },
     ];
     for (const d of sprintDefs) {
-      // 报名光柱立在起点路侧（路外 12m 不挡道）
-      const s0 = d.route.samples[0];
-      d.pos = s0.pos.clone().addScaledVector(s0.side, 12).setY(0);
+      // 报名光柱立在起点路侧：试多个横向偏移，取第一个离所有路面 ≥6m 的位置
+      //（湖滨路/国道起点在城市路口内，四面皆路 → 报名点顺路后挪到出城直段 6% 处）
+      const R = d.route;
+      const s0 = R.samples[Math.floor(R.samples.length * 0.06)];
+      let pos = null;
+      for (const off of [12, -12, 20, -20, 28, -28]) {
+        const cand = s0.pos.clone().addScaledVector(s0.side, off).setY(0);
+        if (this.world.distToRoads(cand.x, cand.z) > 6) { pos = cand; break; }
+      }
+      d.pos = pos || s0.pos.clone().addScaledVector(s0.side, 12).setY(0);
       d.radius = 16;
-      d.desc = `${(d.route.length / 1000).toFixed(1)} km · ${d.desc}`;
+      d.desc = `${(R.length / 1000).toFixed(1)} km · ${d.desc}`;
       this.events.push(d);
     }
     this.sprintDefs = sprintDefs;
@@ -892,6 +899,121 @@ export class Game {
     this.setPromptEvent(null);
   }
 
+  // ---- v2.33 碰撞体系 ----
+  // 车身双圆采样：前/后轴各一个碰撞圆（车长 4.5m，单圆会把侧面碰撞判得太晚太深）
+  static carCircles(pos, yaw, r = 1.05, off = 1.25) {
+    const cx = Math.sin(yaw), cz = Math.cos(yaw);
+    return [
+      { x: pos.x + cx * off, z: pos.z + cz * off, r },
+      { x: pos.x - cx * off, z: pos.z - cz * off, r },
+    ];
+  }
+
+  // 玩家 × AI：双圆检测，最深穿透对响应。
+  // 玩家：法向反弹（相对速度弹性 0.35）+ 位置分离 + 横摆扰动；AI：total/speed 惩罚（其位置由路线派生）
+  carVsCar(player, ai, withSound) {
+    const pc = Game.carCircles(player.pos, player.yaw);
+    const ac = Game.carCircles(ai.pos, ai.yaw);
+    let deepest = null;
+    for (const a of pc) {
+      for (const b of ac) {
+        const dx = a.x - b.x, dz = a.z - b.z;
+        const d = Math.hypot(dx, dz), rr = a.r + b.r;
+        if (d < rr && d > 0.001) {
+          const pen = rr - d;
+          if (!deepest || pen > deepest.pen) deepest = { pen, nx: dx / d, nz: dz / d, cx: (a.x + b.x) / 2, cz: (a.z + b.z) / 2 };
+        }
+      }
+    }
+    if (!deepest) return;
+    const { pen, nx, nz, cx, cz } = deepest;
+    // 分离：玩家位置推开全部穿透量（AI 位置是派生的，推不动，用 total 惩罚表达）
+    player.pos.x += nx * pen;
+    player.pos.z += nz * pen;
+    // 法向弹性反弹（e=0.35）：按速度矢量在碰撞法线上的投影算——
+    // 正撞掉速多、侧面擦蹭几乎不掉速（vN/v 比例即对齐度）
+    const vy = player.travelYaw ?? player.yaw;
+    const fX = Math.sin(vy), fZ = Math.cos(vy);
+    const vn = player.speed * (fX * nx + fZ * nz); // >0 = 撞向对方，<0 = 倒车撞
+    const vnAbs = Math.abs(vn);
+    if (vnAbs > 0.5 && Math.abs(player.speed) > 1) {
+      const ratio = Math.min(1, vnAbs / Math.abs(player.speed)); // 撞击对齐度
+      player.speed *= Math.sqrt(Math.max(0.08, 1 - 0.88 * ratio * ratio)); // e=0.35 反弹
+      // 横摆扰动：撞击点在车身的横向力臂决定车头被带偏的方向
+      const lat = (cx - player.pos.x) * Math.cos(player.yaw) - (cz - player.pos.z) * Math.sin(player.yaw);
+      player.driftYaw += Math.sign(lat || 1) * Math.min(0.3, ratio * 0.35);
+      // AI 惩罚：被撞退 + 掉速（其位置由路线派生）
+      ai.total = Math.max(ai.total - pen * 1.2, 0);
+      if (ai.speed != null) ai.speed *= 0.72;
+      if (withSound) {
+        const impact = Math.min(1, vnAbs / 22);
+        if (impact > 0.08) {
+          this.crashShake = Math.max(this.crashShake, 0.3 + impact * 0.5);
+          this.audio.crash(impact);
+        }
+      }
+    }
+  }
+
+  // AI × AI：只交换 total/speed 惩罚（位置派生，无音效）
+  aiVsAi(a, b) {
+    const dx = a.pos.x - b.pos.x, dz = a.pos.z - b.pos.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 3.2 && d > 0.01) {
+      const overlap = (3.2 - d) * 0.5;
+      const lead = a.total > b.total ? a : b;   // 后车撞前车：后车减速
+      const rear = a.total > b.total ? b : a;
+      rear.total = Math.max(rear.total - overlap, 0);
+      rear.speed = Math.min(rear.speed, lead.speed * 0.9);
+    }
+  }
+
+  // 玩家 × 建筑群：双圆 × AABB，推出 + 法向反弹 + 音效/震屏
+  carVsBuildings(dt) {
+    const cols = this.world.bldColliders;
+    if (!cols || !cols.length) return;
+    const p = this.player;
+    const pc = Game.carCircles(p.pos, p.yaw);
+    for (const b of cols) {
+      for (const c of pc) {
+        // 粗筛：圆心离 AABB 外扩圆太远直接跳过
+        const rx = c.x - b.x, rz = c.z - b.z;
+        if (rx * rx + rz * rz > (b.hw + b.hd + c.r) * (b.hw + b.hd + c.r)) continue;
+        // 最近点
+        const qx = Math.max(b.x - b.hw, Math.min(c.x, b.x + b.hw));
+        const qz = Math.max(b.z - b.hd, Math.min(c.z, b.z + b.hd));
+        let dx = c.x - qx, dz = c.z - qz;
+        let d = Math.hypot(dx, dz);
+        if (d >= c.r) continue;
+        if (d < 0.001) { // 圆心在楼内：沿最浅轴推出
+          const px = b.hw + c.r - Math.abs(rx), pz = b.hd + c.r - Math.abs(rz);
+          if (px < pz) { dx = Math.sign(rx) || 1; dz = 0; d = 0.001; }
+          else { dx = 0; dz = Math.sign(rz) || 1; d = 0.001; }
+          const push = Math.min(px, pz);
+          p.pos.x += dx * push; p.pos.z += dz * push;
+        } else {
+          dx /= d; dz /= d;
+          p.pos.x += dx * (c.r - d);
+          p.pos.z += dz * (c.r - d);
+        }
+        // 法向速度反弹：法线从楼指向车外，速度朝楼 = nDotF < 0
+        // 正撞（|-nDotF|≈1）几乎撞停 ×0.15，斜擦（≈0.2）×0.83 滑过
+        const sinY = Math.sin(p.yaw), cosY = Math.cos(p.yaw);
+        const nDotF = dx * sinY + dz * cosY;
+        if (nDotF < -0.05) { // 正在撞向楼
+          const align = -nDotF;                     // 撞击对齐度 0~1
+          const vn = Math.abs(p.speed) * align;     // 法向撞击速度
+          p.speed *= 1 - align * 0.85;
+          p.driftYaw += (Math.random() - 0.5) * align * 0.3;
+          if (vn > 3) {
+            this.crashShake = Math.max(this.crashShake, Math.min(0.85, 0.25 + vn / 30));
+            this.audio.crash(Math.min(1, vn / 25));
+          }
+        }
+      }
+    }
+  }
+
   // ---- v2.32 存档 / 积分 / 车库 ----
   // 纪录读写：有槽位走槽位表，否则回退全局 rg_best_*（测试直开模式兼容）
   getBest(key) {
@@ -1100,27 +1222,26 @@ export class Game {
       this.audio.crash(res.wallHit);
     }
 
-    // ★ 车对车碰撞：双向推开 + 动量交换 + 横摆扰动 + 碰撞音 + 震屏
+    // ★ 车对车碰撞（v2.33 重做：双圆近似车身 + 法向弹性反弹）
+    // 旧版单圆 2.9m：车长 4.5m 导致侧面擦碰判定过晚，且只有位置糊推没有反弹 → "假"
+    // 比赛唯一推进点在此（sprint 用 updateSprint、free 用 updateTraffic，各自的模式块推进）
     for (const ai of this.ais) {
       if (!ai.group.visible) continue;
-      ai.update(dt, this.track, this.player.total);
-      const d = ai.pos.distanceTo(this.player.pos);
-      if (d < 2.9 && d > 0.01) {
-        const n = this.player.pos.clone().sub(ai.pos).normalize();
-        const overlap = 2.9 - d;
-        // 玩家承担 70% 位移（保持可控），AI 被顶开 30%
-        this.player.pos.addScaledVector(n, overlap * 0.7);
-        ai.pos.addScaledVector(n, -overlap * 0.3);
-        // 动量交换：相对速度越大，玩家掉速越多
-        const relSpeed = Math.abs(this.player.speed - (ai.speed || 0));
-        this.player.speed *= 1 - Math.min(0.5, relSpeed * 0.014);
-        // 横摆扰动：被撞得转一下方向
-        this.player.driftYaw += (Math.random() - 0.5) * 0.2;
-        ai.total = Math.max(ai.total - 0.6, 0); // AI 被撞退
-        this.crashShake = 0.65;
-        this.audio.crash(relSpeed / 30);
+      if (this.mode === 'race') ai.update(dt, this.track, this.player.total);
+      this.carVsCar(this.player, ai, true);
+    }
+    // AI × AI（比赛/冲刺赛中互相碰撞，位置由 total 派生 → 只调 total/speed，不出音效防嘈杂）
+    if (this.ais.length >= 2 && this.mode !== 'free') {
+      for (let i = 0; i < this.ais.length; i++) {
+        for (let j = i + 1; j < this.ais.length; j++) {
+          const a = this.ais[i], b = this.ais[j];
+          if (!a.group.visible || !b.group.visible) continue;
+          this.aiVsAi(a, b);
+        }
       }
     }
+    // ★ 建筑碰撞（v2.33）：城市楼群 AABB × 玩家双圆，推出 + 法向反弹 + 音效震屏
+    this.carVsBuildings(dt);
     // 撞击震屏衰减
     this.crashShake = Math.max(0, this.crashShake - dt * 1.6);
 

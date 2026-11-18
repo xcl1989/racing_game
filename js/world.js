@@ -14,7 +14,12 @@ import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材�
 let terrainSampler = null; // buildWorld 烘焙地形后注入（ribbon 在模块顶层，作用域隔离）
 // v2.21：全路网材质注册表 —— realism.js setRoadWet() 按天气湿滑系数改 roughness/envMap
 export const roadMaterials = [];
+// v2.33 缘石后处理：ribbon 只登记缘石作业（顶点+每段中心点），全部路建完后统一生成，
+// 在与其他路面交叉处自动断开——旧版缘石横穿垂直路口的路面（白条压路，audit_08）
+const kerbJobs = [];      // {id, cv, quadCenters, group}
+const ribbonRegistry = []; // {id, samples, width, tex}
 function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
+  const id = ribbonRegistry.length;
   const curve = new THREE.CatmullRomCurve3(pts, closed, 'catmullrom', 0.5);
   // v2.28b: segLen 可调采样密度（默认 8m）。山地 follow 路必须细于地形网格（21m）——
   // 粗弦线在凸形路段会被地形三角刺穿（凸包差 >0.1m 抬升），细到 3m 弦线即面内精确细化
@@ -83,6 +88,8 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   // v2.23 路缘石：沥青路两侧混凝土缘石（顶/内/外三面），道路立体感的最大单一元素。
   // 土路（tex=3）不装；高处路（盘山 44m）不装——远看是悬在山脊线上空的细亮条。
   // 截面 4 点：内底(路面)/内顶(+0.1)/外顶/外底(-0.06 撇入草地)
+  const id0 = ribbonRegistry.length;
+  ribbonRegistry.push({ id: id0, samples, width, tex });
   let mesh;
   let edgeMax = 0;
   for (let i = 0; i <= SEG; i++) {
@@ -92,6 +99,7 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   if (tex !== 3 && edgeMax <= 15) {
     const CH = 0.10, CW = 0.3;           // 缘石高/宽
     const cv = [], cidx = [];
+    const quadCenters = [];              // 每段每侧缘石条带的中心（交叉处断开判定用）
     for (let sd = 0; sd < 2; sd++) {
       const sgn = sd === 0 ? 1 : -1;
       const eh = sd === 0 ? edgeL : edgeR;
@@ -116,29 +124,91 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
         cidx.push(a + 1, b + 1, b + 2, a + 1, b + 2, a + 2);
         cidx.push(a, b, b + 1, a, b + 1, a + 1);
         cidx.push(b + 3, b + 2, a + 3, a + 3, b + 2, a + 2);
+        // 条带中心（路口断开判定用）
+        const s0 = samples[i], s1 = samples[i + 1];
+        quadCenters.push({
+          x: (s0.pos.x + s1.pos.x) / 2 + s0.side.x * sgn * (width / 2 + CW / 2),
+          z: (s0.pos.z + s1.pos.z) / 2 + s0.side.z * sgn * (width / 2 + CW / 2),
+        });
       }
     }
-    const cg = new THREE.BufferGeometry();
-    cg.setAttribute('position', new THREE.Float32BufferAttribute(cv, 3));
-    cg.setIndex(cidx);
-    cg.computeVertexNormals();
-    const curb = new THREE.Mesh(cg, new THREE.MeshStandardMaterial({
-      color: 0xa6a9ad, roughness: 0.95, metalness: 0,
-      side: THREE.DoubleSide,
-    }));
-    curb.receiveShadow = true;
-    curb.castShadow = true;
-    mesh = new THREE.Group();
-    mesh.add(roadMesh, curb);
+    // v2.33 缘石网格延后生成：kerbJobs 登记，buildWorld 末尾 attachCurbs() 统一挂接
+    //（交叉路口与其他路面重叠的条带会被剔除，白条不再横穿垂直路面）
+    kerbJobs.push({ id: id0, cv, quadCenters, group: mesh = new THREE.Group() });
+    mesh.add(roadMesh);
   } else {
     mesh = roadMesh;
   }
   return { mesh, curve, samples, length: curve.getLength() };
 }
 
+// v2.33 缘石统一挂接：全部路建完后执行。与其他路面交叉的缘石条带自动剔除——
+// （每条条带中心到其他路样本的距离 < 其他路半宽+1.2m 即视为交叉，白条不再压路面）
+function attachCurbs() {
+  if (!kerbJobs.length) return;
+  const CELL = 25;
+  const grid = new Map();
+  const key = (x, z) => `${Math.floor(x / CELL)},${Math.floor(z / CELL)}`;
+  for (const r of ribbonRegistry) {
+    for (let i = 0; i < r.samples.length; i += 2) { // 抽样 1/2 提速（交叉判定精度 8~12m 足够）
+      const s = r.samples[i].pos;
+      const k = key(s.x, s.z);
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push({ id: r.id, x: s.x, z: s.z, w: r.width });
+    }
+  }
+  const nearOther = (id, x, z) => {
+    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
+    for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+      const arr = grid.get(`${cx + dx},${cz + dz}`);
+      if (!arr) continue;
+      for (const p of arr) {
+        if (p.id === id) continue;
+        const th = p.w / 2 + 1.6;
+        const ddx = p.x - x, ddz = p.z - z;
+        if (ddx * ddx + ddz * ddz < th * th) return true;
+      }
+    }
+    return false;
+  };
+  const curbMat = new THREE.MeshStandardMaterial({
+    color: 0xa6a9ad, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
+  });
+  let kept = 0, cut = 0;
+  for (const job of kerbJobs) {
+    const keepIdx = [];
+    job.quadCenters.forEach((c, qi) => {
+      if (nearOther(job.id, c.x, c.z)) { cut++; return; }
+      keepIdx.push(qi);
+      kept++;
+    });
+    if (!keepIdx.length) continue;
+    // 重建索引：仅保留未剔除条带（每条带 = 3 组三角 × 顶点基 q*4）
+    const cidx = [];
+    for (const qi of keepIdx) {
+      const a = qi * 4, b = a + 4;
+      cidx.push(a + 1, b + 1, b + 2, a + 1, b + 2, a + 2);
+      cidx.push(a, b, b + 1, a, b + 1, a + 1);
+      cidx.push(b + 3, b + 2, a + 3, a + 3, b + 2, a + 2);
+    }
+    const cg = new THREE.BufferGeometry();
+    cg.setAttribute('position', new THREE.Float32BufferAttribute(job.cv, 3));
+    cg.setIndex(cidx);
+    cg.computeVertexNormals();
+    const curb = new THREE.Mesh(cg, curbMat);
+    curb.receiveShadow = true;
+    curb.castShadow = true;
+    job.group.add(curb);
+  }
+  kerbJobs.length = 0;
+  console.log(`[world] 缘石条带 ${kept} 段保留 / ${cut} 段路口断开`);
+}
+
 export function buildWorld(scene) {
   const group = new THREE.Group();
   scene.add(group);
+  kerbJobs.length = 0;    // v2.33 缘石后处理作业重置（可重复构建）
+  ribbonRegistry.length = 0;
   const beaconBlinks = [];                    // 地标塔顶警示灯
   let eastConnPts, eastConnRoad, southConnPts, southConnRoad;
 
@@ -252,13 +322,17 @@ export function buildWorld(scene) {
   }
   {
     const hp = nearestCurvePoint(highway.curve, 800, 1000, (p) => p.z > 700);
+    // v2.33 径向 T 形汇入：旧版最后两点沿高速方向平行搭接 18m（1.6m 近重叠，
+    // 导流带断裂缘石翘起——audit_07）。改为沿汇入方向垂直切进高速边缘。
+    const prev = new THREE.Vector3(850, Y_CONN, 950);
+    const dir = new THREE.Vector3().subVectors(hp, prev).setY(0).normalize();
     const southPts = [
       new THREE.Vector3(1050, Y_CONN, zs[4] + 6),
       new THREE.Vector3(1000, Y_CONN, 700),
       new THREE.Vector3(920, Y_CONN, 830),
-      new THREE.Vector3(850, Y_CONN, 950),
-      new THREE.Vector3(hp.x + 20, Y_CONN, hp.z - 4),
-      new THREE.Vector3(hp.x + 4, Y_CONN, hp.z),
+      prev,
+      prev.clone().addScaledVector(dir, prev.distanceTo(hp) - 14), // 距高速中心 14m 处（高速半宽 10 + 过渡）
+      hp.clone(),
     ];
     const southConn = ribbon(southPts, false, 14, { roughness: 0.9 });
     group.add(southConn.mesh);
@@ -345,7 +419,13 @@ export function buildWorld(scene) {
     new THREE.Vector3(-90, 0.032, 462),
     new THREE.Vector3(-330, 0.032, 438),
     new THREE.Vector3(-540, 0.032, 384),
-    new THREE.Vector3(-660, 0.032, 300),
+    // v2.33 垂直穿越高速：旧版 (-540,384)→(-660,300) 与高速切向夹角仅 32°，近平行重叠 1.8m。
+    // 高速在该处切向 ≈ (-0.39,-0.92)（南北向）→ 垂直穿越方向 = (-0.92,0.39)（东西向），
+    // 穿越点 P=(-615,341)，前后各 22m 垂直进出。
+    new THREE.Vector3(-594.8, 0.032, 332.4),
+    new THREE.Vector3(-615, 0.032, 341),
+    new THREE.Vector3(-635.2, 0.032, 349.6),
+    new THREE.Vector3(-680, 0.032, 300),
     new THREE.Vector3(-710, 0.032, 180),
     new THREE.Vector3(-720, 0.032, 90),
     new THREE.Vector3(-722, 0.032, 52),   // 终点扎进乡道路面（乡道中心线 z≈52）
@@ -573,18 +653,20 @@ export function buildWorld(scene) {
 
   // ---- 湖东野径：单车道土路环线（绕湖一整圈，两端都咬在湖滨环岛上）----
   // 会车要借野地；heightAt 在此路上加颠簸噪声 → 车身真实起伏
-  // ⚠️ v2.12.2 逐点贴地形铺路（sampleTerrain+0.05）：南段控制点距湖心仅 145-153，落在盆缘坡带内，
-  //    固定 y=0.044 平铺会让路面悬空、车沉到路面下（草地沉车 bug 的另一半根因）
+  // ⚠️ v2.12.2 逐点贴地形铺路（sampleTerrain+0.05）；
+  // ⚠️ v2.33 去掉 0.044 下限：贴岸段地形被湖盆下切到 -0.6~-1.16（水面 -1.5 之上），
+  //    旧版 max(0.044,…) 让路面悬空 0.6~1.1m、车整台陷进路面以下（巡检 audit_03 实锤）。
+  //    地形本身高于水面 → 直接贴地即可，路面始终在水面之上。
   const trailPts = [
     [846, -420], [838, -480], [828, -540], [820, -610], [796, -668],
     [752, -700], [690, -714], [628, -706], [566, -686], [524, -650],
     [500, -600], [496, -556], [498, -505], [494, -470], [520, -448],
-    [556, -448], [600, -424], [660, -415], [700, -420], [750, -424],
-    [794, -420],
+    [556, -448], [600, -424], [660, -415], [700, -420], [752, -446],
+    [800, -464], [836, -458], [846, -426],
   ];
   const trail = ribbon(
-    trailPts.map(([x, z]) => new THREE.Vector3(x, Math.max(0.044, sampleTerrain(x, z) + 0.05), z)),
-    true, 4.5, { roughness: 1, follow: 0.05, minY: 0.044 }, 3
+    trailPts.map(([x, z]) => new THREE.Vector3(x, sampleTerrain(x, z) + 0.05, z)),
+    true, 4.5, { roughness: 1, follow: 0.05, minY: -5 }, 3
   );
   group.add(trail.mesh);
   extraRoadPolys.push(trailPts.map(([x, z]) => [x, z]));
@@ -596,8 +678,9 @@ export function buildWorld(scene) {
     const hp = nearestCurvePoint(highway.curve, 620, -760, (p) => p.z < -560);
     const raw = [
       [hp.x, hp.z],
-      [520, -740], [455, -650], [442, -545], [470, -450], [545, -378], [645, -338], [740, -348], [800, -392],
+      [520, -740], [455, -650], [442, -545], [470, -450], [545, -378], [645, -338], [740, -348], [810, -400],
     ];
+    // v2.33 末点伸进环岛圈带（r16~24）：旧端点 (800,-392) 距环岛中心 34m，断在草地上
     westLakePts = raw.map(([x, z]) => new THREE.Vector3(x, Math.max(0.02, sampleTerrain(x, z) + 0.05), z));
     westLakePts[0].y = hp.y + 0.03; // 端点略抬，压高速防共面
     westLakeRoad = ribbon(westLakePts, false, 9, { color: 0x9a9184, roughness: 1, follow: 0.05, minY: 0.02 });
@@ -684,6 +767,9 @@ export function buildWorld(scene) {
   group.add(lake2);
 
   // ---- 城市楼房 + 街区公园 ----
+  // v2.33 建筑碰撞体：轴对齐脚印 {x, z, hw, hd}（楼块 rotation.y=0，玩家车圆-AABB 推出用）
+  // ⚠️ 声明在块外：块内收集，buildWorld 末尾 return 导出
+  const bldColliders = [];
   // 巷道从街区正中穿过 → 楼房退到四象限（更小更密，城市感更强）
   // 公园街区：四象限草坪（矩形避开巷道与主街）+ 一个水池
   const PARK_BLOCKS = new Set(['1_2', '2_0']);
@@ -790,7 +876,11 @@ export function buildWorld(scene) {
           dummy.scale.set(w, h, dpt);
           dummy.rotation.y = 0;
           dummy.updateMatrix();
-          // v2.25 按楼高入桶
+          // v2.33 记录建筑脚印碰撞体
+          bldColliders.push({
+            x: dummy.position.x, z: dummy.position.z,
+            hw: w / 2, hd: dpt / 2,
+          });
           const bucket = bldBuckets[h < 46 ? 0 : h < 74 ? 1 : 2];
           const bi = bucket.userData.cnt;
           if (bi < N_BLD) {
@@ -832,6 +922,11 @@ export function buildWorld(scene) {
           );
           dummy.scale.set(w, h, dpt);
           dummy.updateMatrix();
+          // v2.33 玻璃塔同样记录脚印碰撞体
+          bldColliders.push({
+            x: dummy.position.x, z: dummy.position.z,
+            hw: w / 2, hd: dpt / 2,
+          });
           const gbucket = glassBuckets[h < 80 ? 0 : 1];
           const gi = gbucket.userData.cnt;
           if (gi < N_GLASS) {
@@ -1085,12 +1180,13 @@ export function buildWorld(scene) {
     sprintRoutes.offroad = routeFromPoints(pts, 7, 'offroad_stampede');
   }
 
-  // 小地图折线（画全路网）：高速 / 城市环线 / 乡道 + 城市街道网格逐条补上
+  // 小地图折线（画全路网）：高速 / 乡道 + 城市街道网格逐条补上
   // ⚠️ 旧版只有 3 条折线，站在城市十字路口地图上空空如也
+  // ⚠️ v2.33 cityRoutePts 不入图：它是隐藏 NPC 车流环线（无实体路面，斜穿街区草地），
+  //    画在图上会变成"小地图有路、实际没路"的幽灵路（用户实机报告）
   const streetPolys = cityStreets.map((s) => [[s.ax, s.az], [s.bx, s.bz]]);
   const minimapPolylines = [
     hPts.map((p) => [p.x, p.z]),
-    cityRoutePts.map((p) => [p.x, p.z]),
     cPts.map((p) => [p.x, p.z]),
     ...streetPolys,
     ...extraRoadPolys,
@@ -1101,12 +1197,15 @@ export function buildWorld(scene) {
     swLinkPts.map((p) => [p.x, p.z]),
   ];
 
+  // v2.33 缘石统一挂接：所有路建完后执行（交叉路口条带剔除）
+  attachCurbs();
+
   return {
     group, highway, cityRoute, country, cityStreets,
     eastConn: eastConnRoad, southConn: southConnRoad, northConn: northConnRoad,
     westLake: westLakeRoad, swLink: swLinkRoad,
     lakeRoad, roundabout, national, mountainRoad, summitRing, trail,
-    sprintRoutes,
+    sprintRoutes, bldColliders,
     terrainH, sampleTerrain, groundSampler, MT,
     lights, update, isRed,
     heightAt, isOnCityRoad, distToCityRoads,
