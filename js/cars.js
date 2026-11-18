@@ -6,38 +6,155 @@ import * as THREE from 'three';
 
 // ---- 车辆目录（顺序即选择界面顺序）----
 export const CAR_SPECS = [
+  // ★ v2.20 全谱系重调：
+  //   极速整体上调到 187~252km/h（铺装上 topSpeed 精确生效），车距明显拉开；
+  //   新增 offroad 越野评级（0=纯跑车铺装专用 → 1=越野王）：
+  //   决定草地/土路掉速——跑车在草地极速只剩 45%，越野王保留 83%
   {
     id: 'ferrari', name: 'Ferrari 458', cn: '法拉利 458', tone: '深红 · V8 均衡王者',
     color: 0x8f1420, useGLB: true,
-    topSpeed: 47,  // m/s ≈ 169km/h
-    accel: 22,
-    brake: 30,
-    grip: 1.0,
+    topSpeed: 62,  // m/s ≈ 223km/h
+    accel: 30,
+    brake: 34,
+    grip: 1.04,
+    offroad: 0,
+    price: 1000,   // 💎 v2.32 车店定价（现实 ~400 万+ → 镇店之宝，区间上限）
   },
   {
     id: 'tesla', name: 'Tesla Model S', cn: '特斯拉 Model S', tone: '珍珠白 · 电动猛兽',
-    color: 0xf4f6f8,
-    topSpeed: 44,
-    accel: 30,
-    brake: 26,
-    grip: 0.92,
+    color: 0xf4f6f8, useGLB: true,  // 真车模：models/tesla.glb（简化的 Sketchfab 实测扫描级模型）
+    topSpeed: 57,   // ≈205km/h：车重极速不冒尖，起步猛
+    accel: 41,
+    brake: 29,
+    grip: 0.88,
+    offroad: 0.1,
+    price: 220,    // 现实 ~70 万
   },
   {
     id: 'porsche', name: 'Porsche 911', cn: '保时捷 911', tone: '竞速黄 · 弯道手术刀',
-    color: 0xf0a80a,
-    topSpeed: 48,
-    accel: 24,
+    color: 0xf0a80a, useGLB: true,  // 真车模：models/porsche.glb（991 车型，轮子已拆分可独立滚动）
+    topSpeed: 63,   // ≈227km/h
+    accel: 31,
+    brake: 38,      // 全库最强制动
+    grip: 1.16,     // 全库最贴弯
+    offroad: 0,
+    price: 460,    // 现实 ~150 万
+
+  },
+  // ---- v2.16 新增三台真车模（GitHub 公开资源，轮子原生分件）----
+  {
+    id: 'su7', name: 'Xiaomi SU7 Max', cn: '小米 SU7 Max', tone: '海湾蓝 · 电驱新锐',
+    color: 0x2f5f7d, useGLB: true,  // models/sus7_max.glb：四轮已分件（3DWheel Front/Rear L/R）
+    topSpeed: 60,   // ≈216km/h
+    accel: 42,      // 电驱起步最猛
+    brake: 31,
+    grip: 1.04,
+    offroad: 0.1,
+    price: 120,    // 现实 ~25 万 → 入门电动（全区间最低价）
+
+  },
+  {
+    id: 'g63', name: 'Mercedes-AMG G63', cn: '奔驰 AMG G63', tone: '曜岩黑 · 方盒子猛兽',
+    color: 0x24282d, useGLB: true,  // models/g63.glb：四轮已分件，车身重、高重心
+    // 轮辋被拆成 14 个 polySurface 辐条/圈片（每片 bbox 中心离轮轴 0.19~0.33m），
+    // 按几何面内偏心规则会被误判静件 → 显式声明这些件属于轮辋、强制滚动
+    wheelRoll: /polySurface|Wheel1A/i,
+    topSpeed: 53,   // ≈191km/h：车重风阻大，铺装极速倒数
+    accel: 26,
+    brake: 31,
+    grip: 0.90,     // 高重心转向钝
+    offroad: 0.8,   // 非铺装路面第二强（越野方盒子）
+    price: 640,    // 现实 ~240 万（奢侈税）
+  },
+  {
+    id: 'concept', name: 'Khronos Concept', cn: 'Khronos 概念车', tone: '霜银 · 未来主义实验体',
+    color: 0xc9d3dd, useGLB: true,  // models/concept.glb：Khronos 官方 CC0，轮命名 WheelFrontL/Rim…
+    // 轮辋由 Rim1/Rim2 两个半壳组成，其中一个半壳 bbox 中心偏 0.11m 被误判静件（前轮判反）
+    wheelRoll: /Rim1|Rim2/i,
+    topSpeed: 66,   // ≈238km/h
+    accel: 33,
+    brake: 34,
+    grip: 1.10,
+    offroad: 0,
+    price: 760,    // 概念车（虚构稀缺）· 全库极速榜首
+  },
+  // ---- v2.16.1 二批：管线加工后接入 ----
+  {
+    id: 'm4', name: 'BMW M4', cn: '宝马 M4', tone: '竞速蓝 · 直线悍将',
+    color: 0x1b4fae, useGLB: true,  // models/bmw_m4_opt.glb：四轮合并单 mesh → tools_split_wheels_quad 拆分
+    topSpeed: 64,   // ≈230km/h：直线极速第二，仅次于 SU7 Ultra
+    accel: 32,
+    brake: 35,
+    grip: 1.10,
+    offroad: 0,
+    price: 340,    // 现实 ~90 万
+
+  },
+  // ---- v2.19 新车：Sketchfab recycled 系直上（与 SU7/G63 同构，3DWheel 分件）----
+  {
+    id: 'm2g87', name: 'BMW M2 (G87)', cn: '宝马 M2', tone: '烈焰橙 · 纽北小钢炮',
+    color: 0xc2621a, useGLB: true,  // models/sedan_main.glb：26 万面 Draco；材质 Paint/Window 可换漆
+    // 轮辋为 polySurface 辐条群 + Wheel1A 命名（与 G63 同款），spec.wheelRoll 显式声明强制滚动
+    wheelRoll: /polySurface|Wheel1A/i,
+    topSpeed: 61,   // ≈220km/h：实车 460 马力
+    accel: 33,
+    brake: 35,
+    grip: 1.09,     // 小钢炮贴弯
+    offroad: 0,
+    price: 280,    // 现实 ~60 万
+
+  },
+  // ---- v2.20 三台新车（raw 直连下载 → tools_simplify 简化 → 直上）----
+  {
+    id: 'jeep392', name: 'Jeep Wrangler 392', cn: 'Jeep 牧马人 Rubicon 392', tone: '岩湖蓝 · 硬派越野图腾',
+    color: 0x2e6fc0, useGLB: true,  // models/jeep_wrangler_392_opt.glb：36.8万面→16.6万面；Ani_Wheel 分件
+    // 轮命名交叉错位（BL/BR 件在前轴、FL/FR 在后轴），每轮由 Wheel_* 子树 + Disc_* 子树组成；
+    // Disc 子树曾被中位数 hub 误判静件成空轮组 → wheelRoll 强制 Wheel/Disc 件滚动（卡钳含 brake 字样仍静件）
+    wheelRoll: /Ani_Wheel|Ani_Disc/i,
+    // 方盒子高重心：铺装极速垫底档、转向最钝；但草地/土路掉速全库最少
+    topSpeed: 52,   // ≈187km/h
+    accel: 27,
+    brake: 30,
+    grip: 0.86,
+    offroad: 1.0,   // 越野王：草地保留 83% 极速
+    price: 240,    // 现实 ~55 万 · 冲越野赛性价比之选
+
+  },
+  {
+    id: 'yu7', name: 'Xiaomi YU7', cn: '小米 YU7', tone: '松岭绿 · 家庭纯电 SUV',
+    color: 0x35754e, useGLB: true,  // models/xiaomi_yu7_opt.glb：58.6万面→24万面；CarPaint/Windows 材质
+    topSpeed: 58,   // ≈209km/h：双电机 SUV，极速/加速略逊 SU7 Max
+    accel: 40,
     brake: 32,
-    grip: 1.08,
+    grip: 1.00,
+    offroad: 0.45,  // SUV：轻度越野能力
+    price: 160,    // 现实 ~27 万
+
+  },
+  {
+    id: 'su7ultra', name: 'Xiaomi SU7 Ultra', cn: '小米 SU7 Ultra', tone: '好望角黄 · 三电机纽北战神',
+    color: 0xf2c811, useGLB: true,  // models/xiaomi_su7_ultra_opt.glb：68.7万面→24.8万面；黑金拉花独立材质不换漆
+    topSpeed: 70,   // ≈252km/h：1548 马力三电机，全库极速/加速双第一
+    accel: 45,
+    brake: 37,
+    grip: 1.11,
+    offroad: 0,
+    price: 520,    // 现实 ~80 万 · 性能天花板档（定价上探）
+
   },
 ];
 
 // ---- 材质 ----
 function paintMat(color) {
+  // v2.31 与 car.js createCarFromTemplate 同规：明度提亮补偿（ACES + 背光下深色漆发黑）
+  const c = new THREE.Color(color);
+  const hsl = { h: 0, s: 0, l: 0 };
+  c.getHSL(hsl);
+  c.setHSL(hsl.h, Math.min(1, hsl.s * 1.05), Math.min(0.9, hsl.l * 1.18 + 0.02));
   return new THREE.MeshPhysicalMaterial({
-    // 介电底漆 + 清漆：饱和度不被金属反射冲淡（高金属度会把漆色冲白）
-    color, metalness: 0.15, roughness: 0.38,
-    clearcoat: 1.0, clearcoatRoughness: 0.08, envMapIntensity: 0.85,
+    // 介电底漆 + 清漆：饱和度不被金属反射冲淡（高金属度会把漆色冲白/压黑）
+    color: c, metalness: 0.15, roughness: 0.34,
+    clearcoat: 1.0, clearcoatRoughness: 0.08, envMapIntensity: 1.2,
     side: THREE.DoubleSide, // 放样面片双面，免受绕序影响
   });
 }

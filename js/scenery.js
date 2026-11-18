@@ -3,9 +3,12 @@
 import * as THREE from 'three';
 import {
   makeGrassTexture, makeWaterNormal, makeTuftTexture,
-  makeBillboardTexture, makeBirdTexture,
+  makeBillboardTexture, makeBirdTexture, makeFieldTexture,
 } from './textures.js';
 import { HALF_WIDTH } from './track.js';
+import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
+import { makeFoliageTexture } from './textures.js';           // v2.25 叶丛斑驳贴图
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js'; // v2.25 树冠平滑
 
 export function buildScenery(scene, track, world, rich = true) {
   // rich=false（手机低配）：植被减量、跳过装饰性 Props
@@ -14,6 +17,9 @@ export function buildScenery(scene, track, world, rich = true) {
   const samples = track.samples;
   const dummy = new THREE.Object3D();
   const tmpColor = new THREE.Color();
+  // 山地高度场（world.groundSampler 与渲染面同源：山框内=21m 山面网格、框外=5200 平面三角插值）：
+  // 所有植被/岩石按地形贴地，山区不种田不立风机
+  const TH = world.groundSampler || world.sampleTerrain || world.terrainH || (() => 0);
 
   // 到任何道路（环道/直线赛道/高速/乡道/城市街道）的距离
   function distToTrack(x, z) {
@@ -30,46 +36,138 @@ export function buildScenery(scene, track, world, rich = true) {
     return Math.min(Math.sqrt(bd), stripDist, world.distToRoads(x, z));
   }
 
-  // ---- 地面：大尺度顶点色起伏（打破平铺感）+ 草地纹理 ----
-  const groundGeo = new THREE.CircleGeometry(2600, 96);
+  // ---- 地面：位移网格（山体隆起 + 河道/湖盆下切成形）+ 顶点色 + 草地纹理 ----
+  // v2.12：由平盘圆面改为 120x120 位移网格，直接采样 world.terrainH（含水文下切）
+  const groundGeo = new THREE.PlaneGeometry(5200, 5200, 120, 120);
+  groundGeo.rotateX(-Math.PI / 2); // 本地 (x,y) → 世界 (x,z)
   {
     const pos = groundGeo.attributes.position;
     const colors = new Float32Array(pos.count * 3);
     for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i), y = pos.getY(i);
+      const x = pos.getX(i), z = pos.getZ(i);
+      const h = world.sampleTerrain(x, z); // 与物理 heightAt 同源（烘焙双线性），地形/车/植被四方一致
+      pos.setY(i, h); // 山体隆起 + 河湖下切（与物理同一函数）
       // 多频正弦叠加 = 平滑的草地色块起伏（亮绿↔暗绿↔微黄）
-      const n1 = Math.sin(x * 0.0045) * Math.cos(y * 0.0035);
-      const n2 = Math.sin((x + y) * 0.0016);
+      const n1 = Math.sin(x * 0.0045) * Math.cos(z * 0.0035);
+      const n2 = Math.sin((x + z) * 0.0016);
       const shade = 0.82 + n1 * 0.13 + n2 * 0.1;
-      colors[i * 3] = shade * 1.02;
-      colors[i * 3 + 1] = shade;
-      colors[i * 3 + 2] = shade * 0.78;
+      let r = shade * 1.02, g = shade, b = shade * 0.78;
+      // v2.12.1 岸线成形：仅在水域邻近带内按高度着色——岸坡露沙、水线以下湿泥，
+      // 不再让绿草直插水面（否则湖观感像贴在草地上的浅色平地）
+      const dL1 = Math.hypot(x - 660, z + 560);        // 湖1（盆缘 146）
+      const dL2 = Math.hypot(x + 1500, z + 1900);      // 湖2（盆缘 205）
+      const dR = Math.abs(x + 900);                    // 河道（岸坡外缘 42）
+      if ((dL1 < 150 || dL2 < 215 || dR < 55) && h < 0.35) {
+        const sand = 1 - THREE.MathUtils.smoothstep(h, -1.6, 0.35); // 越低越沙
+        const wet = 1 - THREE.MathUtils.smoothstep(h, -1.7, -0.5);  // 水线以下湿泥
+        const sr = 0.78 * (1 - wet) + 0.4 * wet;   // 沙(0.78,0.69,0.5) → 湿泥(0.4,0.35,0.27)
+        const sg = 0.69 * (1 - wet) + 0.35 * wet;
+        const sb = 0.5 * (1 - wet) + 0.27 * wet;
+        r = r * (1 - sand) + sr * sand;
+        g = g * (1 - sand) + sg * sand;
+        b = b * (1 - sand) + sb * sand;
+      }
+      colors[i * 3] = r;
+      colors[i * 3 + 1] = g;
+      colors[i * 3 + 2] = b;
     }
     groundGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    groundGeo.computeVertexNormals();
   }
   const ground = new THREE.Mesh(groundGeo, new THREE.MeshStandardMaterial({
     map: makeGrassTexture(170), // 平铺更密：34m/格，防手机端马赛克感
     vertexColors: true,
     roughness: 1, metalness: 0,
   }));
-  ground.rotation.x = -Math.PI / 2;
   ground.receiveShadow = true;
   scene.add(ground);
 
-  // ---- 湖 ----
-  const lakePos = { x: 620, z: -520 };
+  // ---- 湖（盆地下切后的水面：低于地面 1.5m，盆缘 136-146 收紧成陡岸）----
+  // 新位置 (660,-560)；world.js 湖滨路环岛与湖东野径按此坐标衔接（野径 d≥145 贴岸顶）
+  // v2.24 换 water.js 材质（顶点波浪/菲涅尔/泡沫）；方形细分网格承载波浪，水线由地形反推 d≈136
+  const lakePos = { x: 660, z: -560, r: 138 };
   if (distToTrack(lakePos.x, lakePos.z) > 120) {
+    const lakeNormal = makeWaterNormal();
+    lakeNormal.repeat.set(23, 23); // ~14m/格
     const lake = new THREE.Mesh(
-      new THREE.CircleGeometry(150, 48),
-      new THREE.MeshStandardMaterial({
-        color: 0x1c6ba0, metalness: 0.9, roughness: 0.08,
-        normalMap: makeWaterNormal(), normalScale: new THREE.Vector2(0.25, 0.25),
-        envMapIntensity: 1.5,
+      new THREE.PlaneGeometry(330, 330, 64, 64),
+      makeWaterMaterial({
+        deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.95,
+        shoreMode: 'circle', center: [lakePos.x, lakePos.z], shoreR: 136,
+        band: 26, foamBand: 3.5, waveAmp: 0.06,
+        normalTex: lakeNormal, normalScale: 0.4, repeat: 23,
       })
     );
     lake.rotation.x = -Math.PI / 2;
-    lake.position.set(lakePos.x, 0.05, lakePos.z);
+    lake.position.set(lakePos.x, -1.5, lakePos.z);
     scene.add(lake);
+
+    // 湖畔木栈桥（从东北岸伸向湖心：架高板道 + 长桩入水触底）
+    const woodMat = new THREE.MeshStandardMaterial({ color: 0x8a6a48, roughness: 0.9 });
+    const pier = new THREE.Group();
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.22, 62), woodMat);
+    deck.position.set(0, 0.75, 0);
+    deck.castShadow = true;
+    pier.add(deck);
+    for (let k = 0; k < 8; k++) {
+      for (const s of [-1, 1]) {
+        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.16, 2.6, 6), woodMat);
+        post.position.set(s * 1.1, 0.15, -28 + k * 8);
+        pier.add(post);
+      }
+    }
+    // 栈桥方向：从湖岸指向湖心（湖心→环岛方向的反向）
+    const dirX = 820 - lakePos.x, dirZ = -420 - lakePos.z;
+    const dl = Math.hypot(dirX, dirZ);
+    const ux = dirX / dl, uz = dirZ / dl;
+    const shoreX = lakePos.x + ux * lakePos.r, shoreZ = lakePos.z + uz * lakePos.r;
+    pier.position.set(shoreX + ux * 30, -0.55, shoreZ + uz * 30);
+    // 组 y=-0.55：岸端板面 ≈ +0.2 齐地面，水上端悬于水面 1.7m 的架高板道
+    pier.rotation.y = Math.atan2(ux, uz); // 长轴(+Z)沿伸入湖心的方向
+    scene.add(pier);
+
+    // 湖上小船两叶（浮于 -1.5 水面）
+    const boatMat = new THREE.MeshStandardMaterial({ color: 0xd8dfe4, roughness: 0.6 });
+    const hullMat = new THREE.MeshStandardMaterial({ color: 0x4a6a8a, roughness: 0.5, metalness: 0.3 });
+    for (const [bx, bz, ba] of [[720, -510, 0.6], [610, -610, 2.4]]) {
+      const boat = new THREE.Group();
+      const hull = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.7, 5), hullMat);
+      hull.position.y = 0.1;
+      boat.add(hull);
+      const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.8, 2.4), boatMat);
+      cabin.position.set(0, 0.75, 0.4);
+      boat.add(cabin);
+      boat.position.set(bx, -1.25, bz);
+      boat.rotation.y = ba;
+      scene.add(boat);
+    }
+
+    // 湖畔农舍三栋（红墙白窗 + 坡顶，散在环岛西侧的坡地上）
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0xb04a3a, roughness: 0.85 });
+    const roofMat = new THREE.MeshStandardMaterial({ color: 0x4a3f38, roughness: 0.9 });
+    const glassMat = new THREE.MeshStandardMaterial({
+      color: 0x88a8c0, roughness: 0.2, metalness: 0.6, envMapIntensity: 1.2,
+    });
+    for (const [cx, cz, rot] of [[868, -368, 0.5], [888, -452, -0.9], [852, -478, 2.2]]) {
+      const house = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(9, 4.2, 7), wallMat);
+      body.position.y = 2.1;
+      body.castShadow = true;
+      house.add(body);
+      const roof = new THREE.Mesh(new THREE.ConeGeometry(6.4, 3, 4), roofMat);
+      roof.position.y = 5.6;
+      roof.rotation.y = Math.PI / 4;
+      roof.castShadow = true;
+      house.add(roof);
+      for (const wx of [-2.6, 2.6]) {
+        const win = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.4, 0.15), glassMat);
+        win.position.set(wx, 2.2, 3.55);
+        house.add(win);
+      }
+      house.position.set(cx, 0, cz);
+      house.rotation.y = rot;
+      scene.add(house);
+    }
   }
 
   // ---- 远景山脉：西北山脊群（大体积，围绕山脚湖）+ 环周背景山 ----
@@ -159,6 +257,10 @@ export function buildScenery(scene, track, world, rich = true) {
   railGroup.add(postsW, postsR);
   scene.add(railGroup); // 默认隐藏，由 game 按 mode 切换
 
+  // 展示台清场（v2.14）：赛道内圈选车展厅展示点 (0,-100) 半径 16m 内不生成任何地物，
+  // 否则环绕相机会周期性被树干/岩石穿模遮挡
+  const inShowroom = (x, z) => Math.hypot(x, z + 100) < 40;
+
   // ---- 灌木丛（路外低矮点缀，比树更密）----
   const N_BUSH = Math.round(400 * D);
   const bushGeo = new THREE.IcosahedronGeometry(1, 1);
@@ -170,9 +272,10 @@ export function buildScenery(scene, track, world, rich = true) {
     const x = (Math.random() * 2 - 1) * 1500;
     const z = (Math.random() * 2 - 1) * 1500;
     const d = distToTrack(x, z);
-    if (d < HALF_WIDTH + 4 || d > 300) continue;
+    if (d < HALF_WIDTH + 4 || d > 300 || TH(x, z) < -0.4 || inShowroom(x, z)) continue; // 不下水
     const sc = 0.35 + Math.random() * 0.7;
-    dummy.position.set(x, sc * 0.55, z);
+    const th = TH(x, z);
+    dummy.position.set(x, sc * 0.55 + th, z);
     dummy.scale.set(sc, sc * 0.7, sc);
     dummy.rotation.y = Math.random() * Math.PI;
     dummy.updateMatrix();
@@ -186,48 +289,135 @@ export function buildScenery(scene, track, world, rich = true) {
   bushes.instanceColor.needsUpdate = true;
   scene.add(bushes);
 
-  // ---- 树：树干 + 3 团椭球树冠 ----
+  // ---- 树：双树种（v2.23）——阔叶（干+4椭球冠）70% / 针叶（干+3层锥冠）30% ----
+  // 剪影多样性是植被观感的第一要素：满屏同形椭球 = "贴图树"，混入锥形针叶立刻像林子
+  // v2.25 冠团重制：皱缩噪声八面体球（去光滑圆球感）+ 每棵树随机 4 团布局（破对称棒棒糖）
   const N_TREE = Math.round(650 * D);
+  // 皱缩叶冠几何：顶点按确定性噪声径向扰动，mergeVertices 后平滑法线
+  // （PolyhedronGeometry 是非索引几何，同位置顶点噪声值相同 → 扰动不撕裂；再平滑法线去面片感）
+  function lumpyLeaf() {
+    const g = mergeVertices(new THREE.IcosahedronGeometry(1, 2), 1e-4);
+    const p = g.attributes.position;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) {
+      v.fromBufferAttribute(p, i);
+      const n = Math.sin(v.x * 3.1 + 1.2) * Math.sin(v.y * 2.7 + 3.4) * Math.sin(v.z * 3.3 + 1.1)
+        + 0.5 * Math.sin(v.x * 5.7 + v.z * 4.9)
+        + 0.35 * Math.sin(v.y * 7.3 - v.x * 2.1);
+      const m = 1 + 0.17 * n;
+      p.setXYZ(i, v.x * m, v.y * m * 0.9, v.z * m);
+    }
+    g.computeVertexNormals();
+    return g;
+  }
+  const leafGeo = lumpyLeaf();
+  const foliageTex = makeFoliageTexture();
   const trunkGeo = new THREE.CylinderGeometry(0.18, 0.3, 2.6, 7);
-  const trunk = new THREE.InstancedMesh(trunkGeo,
-    new THREE.MeshStandardMaterial({ color: 0x5d4230, roughness: 1 }), N_TREE);
-  const leafGeo = new THREE.IcosahedronGeometry(1, 1);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 });
+  const trunk = new THREE.InstancedMesh(trunkGeo, trunkMat, N_TREE); // v2.13 instanceColor 染干
   const canopy = new THREE.InstancedMesh(leafGeo,
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 }), N_TREE * 3);
-  trunk.castShadow = canopy.castShadow = true;
-  const blobOffsets = [
-    [0, 3.4, 0, 1.45], [0.85, 2.9, 0.3, 1.0], [-0.7, 3.0, -0.5, 1.05],
-  ];
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_TREE * 4);
+  // v2.23 针叶树实例集
+  const pineTrunk = new THREE.InstancedMesh(trunkGeo, trunkMat, N_TREE);
+  const coneGeo = new THREE.ConeGeometry(1, 1, 8);
+  const conifer = new THREE.InstancedMesh(coneGeo,
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_TREE * 3);
+  trunk.castShadow = canopy.castShadow = pineTrunk.castShadow = conifer.castShadow = true;
+  const pineLayers = [[2.4, 1.7, 1.6], [3.5, 1.3, 1.4], [4.4, 0.85, 1.2]]; // [底y, 半径, 层高]
+  // v2.25 每棵树随机冠团布局：1 大顶团 + 3 侧团（随机方位/半径/高度/尺寸）
+  function makeBlobLayout() {
+    const blobs = [[0, 3.5 + Math.random() * 0.3, 0, 1.3 + Math.random() * 0.3]];
+    const a0 = Math.random() * Math.PI * 2;
+    const sideN = 3;
+    for (let b = 0; b < sideN; b++) {
+      const a = a0 + (b / sideN) * Math.PI * 2 + (Math.random() - 0.5) * 1.0;
+      const r = 0.55 + Math.random() * 0.4;
+      blobs.push([
+        Math.cos(a) * r,
+        2.7 + Math.random() * 1.0,
+        Math.sin(a) * r,
+        0.75 + Math.random() * 0.4,
+      ]);
+    }
+    return blobs;
+  }
   placed = 0; tries = 0;
-  while (placed < N_TREE && tries < 5000) {
+  let pineN = 0;
+  while (placed + pineN < N_TREE && tries < 5000) {
     tries++;
     const x = (Math.random() * 2 - 1) * 1500;
     const z = (Math.random() * 2 - 1) * 1500;
     const d = distToTrack(x, z);
-    if (d < HALF_WIDTH + 7 || d > 500) continue;
+    if (d < HALF_WIDTH + 7 || d > 500 || TH(x, z) < -0.4 || inShowroom(x, z)) continue; // 不下水/展厅清场
     const sc = 0.8 + Math.random() * 1.5;
-    const tint = 0.75 + Math.random() * 0.45;
-    dummy.position.set(x, 1.3 * sc, z);
+    const th = TH(x, z);
+    const isPine = Math.random() < 0.3;
+    dummy.position.set(x, 1.3 * sc + th, z);
     dummy.scale.set(sc, sc, sc);
     dummy.rotation.y = Math.random() * Math.PI;
     dummy.updateMatrix();
-    trunk.setMatrixAt(placed, dummy.matrix);
-    for (let b = 0; b < 3; b++) {
-      const [ox, oy, oz, bs] = blobOffsets[b];
-      dummy.position.set(x + ox * sc, oy * sc, z + oz * sc);
-      dummy.scale.set(bs * sc, bs * sc * 0.85, bs * sc);
-      dummy.updateMatrix();
-      const idx = placed * 3 + b;
-      canopy.setMatrixAt(idx, dummy.matrix);
-      tmpColor.setRGB(0.24 * tint, 0.44 * tint, 0.22 * tint);
-      canopy.setColorAt(idx, tmpColor);
+    // v2.13 树干色差：灰褐→红褐随机
+    const tb = 0.75 + Math.random() * 0.5;
+    tmpColor.setRGB(0.42 * tb, 0.30 * tb, 0.21 * tb);
+    if (isPine) {
+      pineTrunk.setMatrixAt(pineN, dummy.matrix);
+      pineTrunk.setColorAt(pineN, tmpColor);
+      // 锥冠三层（针叶更深更冷，山顶林感的深绿）+ v2.25 层间随机抖动
+      for (let b = 0; b < 3; b++) {
+        const [cy, cr, chh] = pineLayers[b];
+        const jr = cr * (0.85 + Math.random() * 0.3);   // 半径抖动
+        const jh = chh * (0.9 + Math.random() * 0.25);  // 层高抖动
+        dummy.position.set(
+          x + (Math.random() - 0.5) * 0.2 * sc,
+          (cy + jh / 2) * sc + th,
+          z + (Math.random() - 0.5) * 0.2 * sc
+        );
+        dummy.scale.set(jr * sc, jh * sc, jr * sc);
+        dummy.rotation.y = Math.random() * Math.PI;
+        dummy.updateMatrix();
+        const idx = pineN * 3 + b;
+        conifer.setMatrixAt(idx, dummy.matrix);
+        const tint = 0.55 + Math.random() * 0.35;
+        tmpColor.setRGB(0.16 * tint, 0.34 * tint, 0.20 * tint);
+        conifer.setColorAt(idx, tmpColor);
+      }
+      pineN++;
+    } else {
+      trunk.setMatrixAt(placed, dummy.matrix);
+      trunk.setColorAt(placed, tmpColor);
+      const blobs = makeBlobLayout();
+      for (let b = 0; b < blobs.length; b++) {
+        const [ox, oy, oz, bs] = blobs[b];
+        dummy.position.set(x + ox * sc, oy * sc + th, z + oz * sc);
+        dummy.scale.set(bs * sc, bs * sc * 0.85, bs * sc);
+        dummy.rotation.y = Math.random() * Math.PI;
+        dummy.updateMatrix();
+        const idx = placed * 4 + b;
+        canopy.setMatrixAt(idx, dummy.matrix);
+        // v2.13 树冠色域拉宽：明度 + 色相双向抖动（暖黄绿 ↔ 深冷绿，Forza 植被的杂生感）
+        // v2.25 整体提亮一档（叶丛贴图有暗斑，叠加后偏墨绿）
+        const tint = 0.68 + Math.random() * 0.62;
+        const hueR = (Math.random() - 0.5) * 0.10;  // 暖端：叶绿素衰变泛黄
+        const hueB = (Math.random() - 0.5) * 0.06;  // 冷端：偏蓝的深绿
+        tmpColor.setRGB(
+          Math.max(0.05, 0.27 * tint + hueR),
+          Math.max(0.1, 0.50 * tint),
+          Math.max(0.05, 0.25 * tint + hueB)
+        );
+        canopy.setColorAt(idx, tmpColor);
+      }
+      placed++;
     }
-    placed++;
   }
   trunk.count = placed;
-  canopy.count = placed * 3;
+  canopy.count = placed * 4;
+  pineTrunk.count = pineN;
+  conifer.count = pineN * 3;
+  trunk.instanceColor.needsUpdate = true;
   canopy.instanceColor.needsUpdate = true;
-  scene.add(trunk, canopy);
+  pineTrunk.instanceColor.needsUpdate = true;
+  conifer.instanceColor.needsUpdate = true;
+  scene.add(trunk, canopy, pineTrunk, conifer);
 
   // ---- 岩石 ----
   const N_ROCK = Math.round(230 * D);
@@ -240,9 +430,9 @@ export function buildScenery(scene, track, world, rich = true) {
     const x = (Math.random() * 2 - 1) * 1400;
     const z = (Math.random() * 2 - 1) * 1400;
     const d = distToTrack(x, z);
-    if (d < HALF_WIDTH + 5 || d > 350) continue;
+    if (d < HALF_WIDTH + 5 || d > 350 || TH(x, z) < -0.4 || inShowroom(x, z)) continue; // 不下水/展厅清场
     const sc = 0.4 + Math.random() * 1.8;
-    dummy.position.set(x, sc * 0.35, z);
+    dummy.position.set(x, sc * 0.35 + TH(x, z), z);
     dummy.scale.set(sc * (0.8 + Math.random() * 0.6), sc * 0.7, sc);
     dummy.rotation.y = Math.random() * Math.PI;
     dummy.updateMatrix();
@@ -259,6 +449,91 @@ export function buildScenery(scene, track, world, rich = true) {
 
   // （楼房已迁移至 world.js 城市街区，按路网对齐摆放）
 
+  // ---- 农田色块：麦田/青苗/耕地的大矩形（打破草地一整片绿的空旷感）----
+  if (!skipProps) {
+    const fieldGeo = new THREE.PlaneGeometry(1, 1);
+    fieldGeo.rotateX(-Math.PI / 2);
+    const fields = new THREE.InstancedMesh(fieldGeo, new THREE.MeshStandardMaterial({
+      map: makeFieldTexture(), roughness: 1, metalness: 0,
+    }), 14);
+    const fTints = [
+      [0.86, 0.72, 0.35],  // 麦黄
+      [0.42, 0.62, 0.30],  // 青苗
+      [0.55, 0.42, 0.28],  // 犁过的棕壤
+      [0.90, 0.82, 0.30],  // 油菜花黄
+    ];
+    const FIELD_TINTS = fTints.map((c) => tmpColor.setRGB(...c).clone());
+    let fPlaced = 0, fTries = 0;
+    while (fPlaced < 14 && fTries < 3000) {
+      fTries++;
+      const x = (Math.random() * 2 - 1) * 1400;
+      const z = (Math.random() * 2 - 1) * 1400;
+      // 避开道路（distToRoads 已含高速/乡道/城市/湖滨路/国道/山道）与城市街区、湖、山
+      if (world.distToRoads(x, z) < 34) continue;
+      if (TH(x, z) > 1.5 || TH(x, z) < -0.4) continue; // 不上山不下水
+      if (x > 760 && x < 1350 && z > 40 && z < 660) continue;      // 城市范围
+      if (Math.hypot(x - 660, z + 560) < 190) continue;            // 湖
+      if (distToTrack(x, z) < 30) continue;
+      const w = 70 + Math.random() * 110;
+      const th = TH(x, z);
+      dummy.position.set(x, 0.06 + th, z); // 抬 6cm 防远距 Z-fighting
+      dummy.scale.set(w, 1, w * (0.6 + Math.random() * 0.6));
+      dummy.rotation.set(0, Math.random() * Math.PI, 0);
+      dummy.updateMatrix();
+      fields.setMatrixAt(fPlaced, dummy.matrix);
+      tmpColor.copy(FIELD_TINTS[(Math.random() * FIELD_TINTS.length) | 0]);
+      tmpColor.multiplyScalar(0.85 + Math.random() * 0.3);
+      fields.setColorAt(fPlaced, tmpColor);
+      fPlaced++;
+    }
+    fields.count = fPlaced;
+    fields.instanceColor.needsUpdate = true;
+    fields.receiveShadow = true;
+    scene.add(fields);
+  }
+
+  // ---- 松林团簇：三片针叶林（远看深绿一坨，近看锥形塔冠，补荒野层次）----
+  if (!skipProps) {
+    const GROVES = [[-350, -650], [-150, -950], [250, 900]];
+    const N_PINE = 46;
+    const pineTrunkGeo = new THREE.CylinderGeometry(0.28, 0.42, 3.4, 6);
+    const pineConeGeo = new THREE.ConeGeometry(3.2, 13, 8);
+    const trunks = new THREE.InstancedMesh(pineTrunkGeo,
+      new THREE.MeshStandardMaterial({ color: 0x4a3628, roughness: 1 }), N_PINE * GROVES.length);
+    const crowns = new THREE.InstancedMesh(pineConeGeo,
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 }), N_PINE * GROVES.length);
+    trunks.castShadow = crowns.castShadow = true;
+    let pi = 0, pTries = 0;
+    for (const [gx, gz] of GROVES) {
+      let inGrove = 0;
+      while (inGrove < N_PINE && pTries < 5000) {
+        pTries++;
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * 130;
+        const x = gx + Math.cos(a) * r, z = gz + Math.sin(a) * r;
+        if (distToTrack(x, z) < HALF_WIDTH + 10) continue;
+        if (TH(x, z) > 1.5 || TH(x, z) < -0.4) continue; // 不上山不下水
+        const sc = 0.7 + Math.random() * 0.9;
+        const th = TH(x, z);
+        dummy.position.set(x, 1.7 * sc + th, z);
+        dummy.scale.set(sc, sc, sc);
+        dummy.rotation.set(0, Math.random() * Math.PI, 0);
+        dummy.updateMatrix();
+        trunks.setMatrixAt(pi, dummy.matrix);
+        dummy.position.set(x, (3.4 + 6.2) * sc + th, z);
+        dummy.updateMatrix();
+        crowns.setMatrixAt(pi, dummy.matrix);
+        const t = 0.7 + Math.random() * 0.5;
+        tmpColor.setRGB(0.16 * t, 0.33 * t, 0.19 * t);
+        crowns.setColorAt(pi, tmpColor);
+        pi++; inGrove++;
+      }
+    }
+    trunks.count = crowns.count = pi;
+    crowns.instanceColor.needsUpdate = true;
+    scene.add(trunks, crowns);
+  }
+
   // ---- 风力发电机（地平线标志物，叶片常转）----
   const rotors = [];
   const poleMat = new THREE.MeshStandardMaterial({ color: 0xe8eaec, roughness: 0.5, metalness: 0.3 });
@@ -270,6 +545,7 @@ export function buildScenery(scene, track, world, rich = true) {
     const z = (Math.random() * 2 - 1) * 900;
     const d = distToTrack(x, z);
     if (d < HALF_WIDTH + 25 || d > 1800) continue;
+    if (TH(x, z) > 1.5 || TH(x, z) < -0.4) continue; // 不上山水
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 1.4, 52, 10), poleMat);
     pole.position.set(x, 26, z);
     pole.castShadow = true;
@@ -483,6 +759,162 @@ export function buildScenery(scene, track, world, rich = true) {
     scene.add(standGroup);
   }
 
+  // ---- 行道树（v2.13）：城市街道 + 湖滨路/北大道/湖西环路两侧成排（Forza 街景标配）----
+  if (!skipProps) {
+    const tTrunkGeo = new THREE.CylinderGeometry(0.16, 0.26, 2.4, 7);
+    const spots = [];
+    for (const st of world.cityStreets) {
+      const dx = st.bx - st.ax, dz = st.bz - st.az;
+      const len = Math.hypot(dx, dz);
+      const n = Math.floor(len / 48);
+      for (let k = 1; k < n; k++) {
+        const t = k / n;
+        const px = st.ax + dx * t, pz = st.az + dz * t;
+        const ox = (-dz / len) * (st.width / 2 + 3.2);
+        const oz = (dx / len) * (st.width / 2 + 3.2);
+        spots.push([px + ox, pz + oz, px - ox, pz - oz]);
+      }
+    }
+    for (const route of [world.lakeRoad, world.northConn, world.westLake]) {
+      const rs = route.samples;
+      for (let i = 6; i < rs.length - 6; i += 16) {
+        const s = rs[i];
+        for (const sign of [1, -1]) {
+          const p = s.pos.clone().addScaledVector(s.side, sign * (route === world.westLake ? 6.5 : 7.5));
+          spots.push([p.x, p.z]);
+        }
+      }
+    }
+    const N_ST = spots.length;
+    const stTrunk = new THREE.InstancedMesh(tTrunkGeo,
+      new THREE.MeshStandardMaterial({ color: 0x54402e, roughness: 1 }), N_ST);
+    const stCanopy = new THREE.InstancedMesh(leafGeo,
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_ST * 3);
+    stTrunk.castShadow = stCanopy.castShadow = true;
+    let si = 0, sci = 0;
+    for (const spot of spots) {
+      const [x, z, x2, z2] = spot;
+      for (const [px, pz] of (x2 !== undefined ? [[x, z], [x2, z2]] : [[x, z]])) {
+        if (si >= N_ST) break;
+        const th = TH(px, pz);
+        if (th < -0.4) continue; // 湖边不下水
+        const sc = 0.75 + Math.random() * 0.55;
+        dummy.position.set(px, 1.2 * sc + th, pz);
+        dummy.scale.set(sc, sc, sc);
+        dummy.rotation.y = Math.random() * Math.PI;
+        dummy.updateMatrix();
+        stTrunk.setMatrixAt(si, dummy.matrix);
+        // v2.25 三团冠：顶部大团 + 两侧随机小团（随机方位/尺寸，去"双球棒棒糖"）
+        const stBlobs = [[0, 2.95, 0, 1.2 + Math.random() * 0.2]];
+        const sa0 = Math.random() * Math.PI * 2;
+        for (let b = 0; b < 2; b++) {
+          const sa = sa0 + b * Math.PI + (Math.random() - 0.5) * 1.2;
+          stBlobs.push([
+            Math.cos(sa) * (0.5 + Math.random() * 0.3),
+            2.35 + Math.random() * 0.7,
+            Math.sin(sa) * (0.5 + Math.random() * 0.3),
+            0.65 + Math.random() * 0.3,
+          ]);
+        }
+        for (let b = 0; b < stBlobs.length; b++) {
+          const [ox, oy, oz, bs] = stBlobs[b];
+          dummy.position.set(px + ox * sc, oy * sc + th, pz + oz * sc);
+          dummy.scale.set(bs * sc, bs * sc * 0.85, bs * sc);
+          dummy.rotation.y = Math.random() * Math.PI;
+          dummy.updateMatrix();
+          const t = 0.8 + Math.random() * 0.45;
+          tmpColor.setRGB(0.25 * t, 0.5 * t, 0.23 * t);
+          stCanopy.setMatrixAt(sci, dummy.matrix);
+          stCanopy.setColorAt(sci, tmpColor);
+          sci++;
+        }
+        si++;
+      }
+    }
+    stTrunk.count = si; stCanopy.count = sci;
+    stCanopy.instanceColor.needsUpdate = true;
+    scene.add(stTrunk, stCanopy);
+  }
+
+  // ---- 干草垛（v2.13）：田野横放草卷，乡村感（Forza 英国地景标志性物件）----
+  if (!skipProps) {
+    const N_HAY = 26;
+    const hayGeo = new THREE.CylinderGeometry(0.9, 0.9, 1.6, 10);
+    hayGeo.rotateZ(Math.PI / 2); // 横放
+    const hays = new THREE.InstancedMesh(hayGeo,
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }), N_HAY);
+    let hi = 0, hTries = 0;
+    while (hi < N_HAY && hTries < 3000) {
+      hTries++;
+      const x = (Math.random() * 2 - 1) * 1400;
+      const z = (Math.random() * 2 - 1) * 1400;
+      if (world.distToRoads(x, z) < 26 || distToTrack(x, z) < 24 || inShowroom(x, z)) continue;
+      if (TH(x, z) > 1.5 || TH(x, z) < -0.4) continue;
+      if (x > 760 && x < 1350 && z > 40 && z < 660) continue;      // 城市范围
+      if (Math.hypot(x - 660, z + 560) < 190) continue;            // 湖
+      const th = TH(x, z);
+      dummy.position.set(x, 0.9 + th, z);
+      dummy.scale.set(1, 1, 1);
+      dummy.rotation.y = Math.random() * Math.PI;
+      dummy.updateMatrix();
+      const t = 0.85 + Math.random() * 0.3;
+      tmpColor.setRGB(0.78 * t, 0.66 * t, 0.34 * t);
+      hays.setColorAt(hi, tmpColor);
+      hays.setMatrixAt(hi, dummy.matrix);
+      hi++;
+    }
+    hays.count = hi;
+    hays.instanceColor.needsUpdate = true;
+    hays.castShadow = true;
+    scene.add(hays);
+  }
+
+  // ---- 加油站（v2.13）：高速东南段旁（Forza 公路地标）----
+  if (!skipProps) {
+    const gas = new THREE.Group();
+    const canopyMat = new THREE.MeshStandardMaterial({ color: 0xd8443a, roughness: 0.55, metalness: 0.25 });
+    const steelMat = new THREE.MeshStandardMaterial({ color: 0xb8bdc4, roughness: 0.4, metalness: 0.7 });
+    const pumpMat = new THREE.MeshStandardMaterial({ color: 0xe8e9ec, roughness: 0.5, metalness: 0.4 });
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(22, 0.5, 12), canopyMat);
+    deck.position.y = 5.4; deck.castShadow = true;
+    gas.add(deck);
+    for (const cx of [-9, 9]) {
+      for (const cz of [-4.6, 4.6]) {
+        const col = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.32, 5.4, 8), steelMat);
+        col.position.set(cx, 2.7, cz);
+        gas.add(col);
+      }
+    }
+    for (const px of [-3, 3]) {
+      const pump = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.7, 2.2), pumpMat);
+      pump.position.set(px, 0.85, 0);
+      pump.castShadow = true;
+      gas.add(pump);
+      const hose = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.07, 6, 12), steelMat);
+      hose.position.set(px + 0.6, 1.2, 0);
+      gas.add(hose);
+    }
+    // 立牌：发光价牌（远处可见）
+    const sign = new THREE.Mesh(new THREE.BoxGeometry(5.6, 7.5, 0.5), steelMat);
+    sign.position.set(0, 3.75, -9);
+    sign.castShadow = true;
+    gas.add(sign);
+    const board = new THREE.Mesh(new THREE.BoxGeometry(4.6, 4.2, 0.2),
+      new THREE.MeshStandardMaterial({
+        color: 0xd8443a, roughness: 0.5,
+        emissive: 0xff5544, emissiveIntensity: 0.28,
+      }));
+    board.position.set(0, 4.6, -9 + 0.36);
+    gas.add(board);
+    // 落位：高速东南段样条外侧（t≈0.86 → 东南象限，离城市楼群远、玩家东南向必经）
+    const hs = world.highway.samples;
+    const s0 = hs[Math.floor(0.86 * hs.length)];
+    const gp = s0.pos.clone().addScaledVector(s0.side, 26);
+    gas.position.set(gp.x, TH(gp.x, gp.z), gp.z);
+    gas.rotation.y = Math.atan2(s0.tan.x, s0.tan.z) + Math.PI / 2;
+    scene.add(gas);
+  }
+
   // ---- 草簇与花丛：贴路散布，填充草地空旷感 ----
   {
     const N_TUFT = rich ? 2200 : 900;
@@ -504,11 +936,12 @@ export function buildScenery(scene, track, world, rich = true) {
       const x = (Math.random() * 2 - 1) * 1400;
       const z = (Math.random() * 2 - 1) * 1400;
       const d = distToTrack(x, z);
-      if (d < HALF_WIDTH + 1.5 || d > 60) continue; // 贴路 60m 范围带
+      if (d < HALF_WIDTH + 1.5 || d > 60 || TH(x, z) < -0.4) continue; // 贴路 60m 范围带，不下水
+      const th = TH(x, z);
       if (tCount < N_TUFT) {
         const sc = 0.7 + Math.random() * 1.1;
         for (let k = 0; k < 2; k++) {
-          dummy.position.set(x, 0.35 * sc, z);
+          dummy.position.set(x, 0.35 * sc + th, z);
           dummy.scale.set(sc, sc, sc);
           dummy.rotation.set(0, Math.random() * Math.PI + k * Math.PI / 2, 0);
           dummy.updateMatrix();
@@ -517,7 +950,7 @@ export function buildScenery(scene, track, world, rich = true) {
         tCount++;
       }
       if (fCount < N_FLOWER && Math.random() < 0.4) {
-        dummy.position.set(x, 0.09, z);
+        dummy.position.set(x, 0.09 + th, z);
         dummy.scale.set(1, 1, 1);
         dummy.rotation.set(0, 0, 0);
         dummy.updateMatrix();

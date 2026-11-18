@@ -30,14 +30,15 @@ export function buildTrack(scene) {
     const tan = curve.getTangentAt(t).setY(0).normalize();
     const side = new THREE.Vector3(tan.z, 0, -tan.x).normalize(); // 左侧
     if (prev) dist += pos.distanceTo(prev);
-    samples.push({ pos, tan, side, d: dist });
+    // v2.27 samples 附带路宽：导航引导线车道偏移（nav.js 消费）
+    samples.push({ pos, tan, side, d: dist, w: HALF_WIDTH * 2 });
     prev = pos;
   }
   const trackLength = curve.getLength();
 
   // ---- 路面 Ribbon 几何 ----
   const verts = [], uvs = [], idx = [];
-  const uvScale = 6; // 每 6m 重复一次贴图
+  const uvScale = 12; // v2.21.1: 每 12m 重复一次贴图（与 world.js 对齐，标线物理比例）
   for (let i = 0; i <= SEG; i++) {
     const s = samples[i];
     const v = s.d / uvScale;
@@ -159,18 +160,20 @@ export function buildTrack(scene) {
     g.setIndex([0, 1, 2, 1, 3, 2]);
     g.computeVertexNormals();
     const stripRoad = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+      // v2.21.2 ⚠️ 必须 clone：贴图工厂已单例共享，直接改 repeat 会污染全图路面
+      //（曾把世界所有路的虚线压成 9.5cm 周期的"拉链纹"——repeat 是贴图实例的可变状态）
       map: (() => {
-        const t = makeAsphaltTextures().map;
+        const t = makeAsphaltTextures().map.clone();
         t.repeat.set(1, 126);
         return t;
       })(),
       normalMap: (() => {
-        const n = makeAsphaltTextures().normal;
+        const n = makeAsphaltTextures().normal.clone();
         n.repeat.set(1, 126);
         return n;
       })(),
       roughnessMap: (() => {
-        const r = makeAsphaltTextures().roughness;
+        const r = makeAsphaltTextures().roughness.clone();
         r.repeat.set(1, 126);
         return r;
       })(),
@@ -222,11 +225,20 @@ export function buildTrack(scene) {
     strip, distToStrip,
     nearestSample,
     // 判断是否冲出路面（环道或直线加速赛道）
+    // ⚠️ v2.11 修复：worldOnRoad（世界路网：高速/城市/乡道/国道/山道）此前从未被
+    //    消费——玩家在世界路上一直按越野判定（极速 60%+扬尘）。现在接上
+    // v2.20：附 surf 路面材质（'dirt' 土路 → 半越野掉速），由 world.surfaceOf 提供
     isOffroad(pos, hint) {
       const { i, d } = nearestSample(pos, hint);
       const offRoad = d > HALF_WIDTH + 0.8;
       const onStrip = distToStrip(pos.x, pos.z) <= strip.width / 2 + 0.6;
-      return { off: offRoad && !onStrip, hint: i };
+      const onWorld = this.worldOnRoad ? this.worldOnRoad(pos) : false;
+      const off = offRoad && !onStrip && !onWorld;
+      // 只在"确认在世界路网上"时查材质（主环道/直线赛道围场恒为铺装）
+      const surf = (!off && !onStrip && onWorld && this.surfaceOf)
+        ? (this.surfaceOf(pos) || 'pave')
+        : 'pave';
+      return { off, surf, hint: i };
     },
   };
 }

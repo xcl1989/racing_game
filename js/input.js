@@ -1,5 +1,5 @@
 // input.js — 键盘 + 手机触屏虚拟按键统一输入
-// 对外暴露 input 对象：throttle(0/1) brake(0/1) steer(-1..1) handbrake(bool)
+// 对外暴露 input 对象：throttle(0..1) brake(0/1) steer(-1..1) handbrake(bool)
 
 export const input = {
   throttle: 0,
@@ -19,8 +19,8 @@ function refresh() {
   if (keys['d'] || keys['arrowright']) input.steer += 1;
   if (touch.gas) input.throttle = 1;
   if (touch.brake) input.brake = 1;
-  // 自动油门：手机开着只管转向（刹车仍优先）
-  if (touch.auto && !input.brake) input.throttle = 1;
+  // 定速巡航（AUTO）：保持当前速度，不默认加速 —— 见下方 cruise 段
+  if (touch.auto) updateCruise();
   if (gyro.enabled) input.steer = gyro.steer;
   input.handbrake = !!keys[' ']; // 手刹仅键盘保留，触屏走真实赛车路线不用漂移
 }
@@ -30,6 +30,52 @@ function refresh() {
 export function pollInput() { refresh(); }
 
 const touch = { gas: false, brake: false, auto: false };
+
+// ---- 定速巡航（AUTO，v2.17 重做）----
+// 语义：AUTO = 保持当前速度，绝不默认加速。
+//  · 开启瞬间若车静止 → 不给油，原地待命（等人工给过一次油再锁速）
+//  · 巡航中点油门/刹车 = 人工接管（暂停巡航）；松开瞬间锁定当下速度为新目标
+//  · 锁定后用 PI 控制补油：低于目标差得越多油门越大，高于目标直接滑行回目标。
+//    积分项用于消除风阻 `speed*0.4` 与爬坡造成的稳态掉速
+// 车速来源：window.game.player.speed（main.js 尾部调试钩子，m/s）
+const cruise = { target: null, integral: 0, relock: false };
+const CRUISE = { KP: 0.45, KI: 0.55, MAX_I: 2, MIN_LATCH: 0.5 }; // MIN_LATCH m/s 以下不锁速（静止/倒车不自动给油）
+
+function playerSpeed() {
+  const p = window.game && window.game.player;
+  return p && typeof p.speed === 'number' ? p.speed : null;
+}
+
+function cruiseReset() { cruise.target = null; cruise.integral = 0; cruise.relock = false; }
+
+// 帧间隔：refresh() 既被 pollInput 每帧调用，也被按键事件临时调用，用真实时钟差算 dt
+let lastPoll = 0;
+function pollDt() {
+  const now = performance.now();
+  if (!lastPoll) { lastPoll = now; return 0; }
+  const dt = Math.min(0.1, (now - lastPoll) / 1000);
+  lastPoll = now;
+  return dt;
+}
+
+function updateCruise() {
+  // 油门/刹车/手刹任一人工输入都算接管（否则拉手刹减速后巡航会把车再加速拉回目标）
+  const manual = input.throttle || input.brake || input.handbrake;
+  if (manual) { cruise.relock = true; return; } // 人工接管：保持人工油门/刹车值
+  const spd = playerSpeed();
+  if (spd == null) return;                      // 还没进游戏（window.game 未就绪）
+  if (cruise.relock) {                          // 接管刚结束 → 锁定当下速度
+    cruise.relock = false;
+    cruise.target = spd > CRUISE.MIN_LATCH ? spd : null;
+    cruise.integral = 0;
+  }
+  if (cruise.target == null) return;            // 无锁速目标（静止开启）→ 不给油
+  const gap = cruise.target - spd;
+  const dt = pollDt();
+  if (Math.abs(gap) > 0.02) cruise.integral = Math.max(-CRUISE.MAX_I,
+    Math.min(CRUISE.MAX_I, cruise.integral + gap * dt));
+  input.throttle = Math.max(0, Math.min(1, CRUISE.KP * gap + CRUISE.KI * cruise.integral));
+}
 
 // ---- 陀螺仪转向 ----
 // 手机横屏用 beta、竖屏用 gamma；开启瞬间记录回正位，带 5° 死区
@@ -111,18 +157,19 @@ export function initInput(onPause) {
   bindBtn('btn-gas', 'gas');
   bindBtn('btn-brake', 'brake');
 
-  // AUTO 自动油门开关（点按切换）；托管时油门键变暗降噪
+  // AUTO 定速巡航开关（点按切换）；托管时油门键变暗降噪
   const autoEl = document.getElementById('btn-auto');
   if (autoEl) {
     const gasEl = document.getElementById('btn-gas');
     autoEl.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       touch.auto = !touch.auto;
+      cruiseReset(); // 开/关都清空锁速状态：重开时若在行驶中会自动重锁当下速度
       autoEl.classList.toggle('active', touch.auto);
       if (gasEl) gasEl.classList.toggle('dimmed', touch.auto);
       refresh();
     });
-    // 手机默认开启自动油门
+    // 手机默认开启定速巡航（静止时待命，不给油）
     if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
       touch.auto = true;
       autoEl.classList.add('active');

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>霓虹狂飙 · Three.js 赛车</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <!-- 加载进度（最先显示，main.js 就绪后淡出） -->
+  <div id="loading">
+    <div class="ld-box">
+      <h1>霓虹狂飙</h1>
+      <p class="ld-sub">NEON RUSH</p>
+      <div class="ld-bar"><div id="ld-fill"></div></div>
+      <p id="ld-tip">正在铺设柏油路面…</p>
+    </div>
+  </div>
+
+  <!-- 主菜单 -->
+  <div id="menu" class="overlay" style="display:none">
+    <div class="title-block">
+      <h1>霓虹狂飙</h1>
+      <p class="sub">NEON RUSH</p>
+    </div>
+    <p class="ver">v2.32.0 · build 20261118 · 存档/积分/车店/冲刺越野赛：3 槽位 localStorage 存档 + 每 1km=1💎 + 车店购车（120~1000💎）+ 3 条冲刺赛与越野拉力</p>
+    <div class="menu-btns">
+      <button id="btn-continue" style="display:none">▶ 继续游戏 <small id="cont-sub"></small></button>
+      <button id="btn-start">🚗 新存档 <small>选择首辆座驾 · 免费入库</small></button>
+      <button id="btn-saves">🗂 存档管理 <small>3 个槽位 · 读取 / 删除</small></button>
+      <button id="btn-garage" style="display:none">🏪 车店 <small>积分购车 · 更换座驾</small></button>
+    </div>
+    <div class="menu-opts">
+      <button id="btn-gyro">陀螺仪: 关</button>
+      <button id="btn-quality">特效: 高</button>
+      <button id="btn-sound">声音: 开</button>
+    </div>
+    <p class="hint">电脑：WASD/方向键驾驶，空格手刹，Esc 暂停<br>手机：陀螺仪倾斜转向，左手刹车（左下），右手油门（右下，AUTO 为定速巡航：锁当前速度，油门/刹车可接管）<br>短按小地图切缩放，长按小地图打开世界地图：点选任意位置开始 🧭 导航</p>
+  </div>
+
+  <!-- HUD -->
+  <div id="hud" style="display:none">
+    <div id="info-panel">
+      <div id="mode-chip"><span id="mode-val">自由漫游</span></div>
+      <div class="speed-row"><span id="speed-val">0</span><small>km/h</small></div>
+      <div class="sp-bar"><i id="speed-fill"></i></div>
+      <div class="rows">
+        <div class="row" id="lap-box">圈数 <b id="lap-val">1 / 3</b></div>
+        <div class="row" id="rank-box">名次 <b id="rank-val">1 / 4</b></div>
+        <div class="row" id="collect-box"><span id="collect-label">能量环</span> <b id="collect-val">0 / 14</b></div>
+        <div class="row" id="nav-box" style="display:none">导航 <b id="nav-val">--</b></div>
+        <div class="row" id="credit-row">💎 积分 <b id="credit-val">0</b></div>
+        <div class="row">时间 <b id="time-val">0:00.0</b></div>
+        <div class="row" id="best-line">纪录 <b id="best-val">--</b></div>
+      </div>
+    </div>
+    <canvas id="minimap" width="150" height="150"></canvas>
+    <button id="btn-pause">⏸</button>
+  </div>
+
+  <!-- 手机触屏按键 -->
+  <div id="controls" style="display:none">
+    <div class="cluster left">
+      <button class="ctl brake" id="btn-brake">BRAKE</button>
+    </div>
+    <div class="cluster right">
+      <button class="ctl small" id="btn-auto">AUTO</button>
+      <button class="ctl big" id="btn-gas">▲</button>
+    </div>
+  </div>
+
+  <!-- 活动报名面板 -->
+  <div id="event-prompt" style="display:none">
+    <div id="ep-name"></div>
+    <div id="ep-desc"></div>
+    <div class="ep-btns">
+      <button id="btn-join">🚦 开始比赛 <span class="ep-key">(E)</span></button>
+      <button id="btn-dismiss">稍后再说</button>
+    </div>
+  </div>
+
+  <!-- 车型选择（v2.14 Forza 式单车展厅：中央 3D 车模可拖拽旋转，底部切换/确认；
+       carSelect 本体 pointer-events:none 留中部画布收拖拽，控件各自恢复） -->
+  <div id="carSelect" class="overlay" style="display:none">
+    <div class="title-block">
+      <h2>选择座驾</h2>
+      <p class="sub">GARAGE · 拖拽旋转车模</p>
+    </div>
+    <div id="carDots"></div>
+    <div id="carDock">
+      <button id="btn-carPrev" aria-label="上一辆">‹</button>
+      <div id="carInfo">
+        <h3 id="carName"></h3>
+        <div id="carTone"></div>
+        <div id="carPrice"></div>
+        <div id="carStats"></div>
+      </div>
+      <button id="btn-carNext" aria-label="下一辆">›</button>
+    </div>
+    <div id="carActions">
+      <button id="btn-carBack">← 返回</button>
+      <button id="btn-carGo">✓ 开上它</button>
+    </div>
+    <div id="carCards" style="display:none"></div>
+  </div>
+
+  <!-- 暂停菜单（⏸ 触发，v2.19.2） -->
+  <div id="pauseMenu" style="display:none">
+    <div class="pm-title">⏸ 已暂停</div>
+    <button id="btn-resume">▶ 回到游戏</button>
+    <button id="btn-pause-garage">🏪 车店 / 车库</button>
+    <button id="btn-pause-menu">🏠 返回主界面</button>
+  </div>
+
+  <!-- 存档管理（v2.32：3 槽位，卡片由 save.js 元数据渲染） -->
+  <div id="saveSlots" class="overlay" style="display:none">
+    <div class="title-block">
+      <h2>存档管理</h2>
+      <p class="sub">SAVE SLOTS · 最多 3 个存档</p>
+    </div>
+    <div id="slotList"></div>
+    <div class="menu-btns">
+      <button id="btn-slots-back">← 返回</button>
+    </div>
+  </div>
+
+  <!-- 大地图导航（长按小地图打开，v2.18：点选任意位置设目的地） -->
+  <div id="bigMap" style="display:none">
+    <div class="bm-title" id="bm-title">🧭 世界地图 · 点选目的地</div>
+    <canvas id="bigMapCanvas" width="1024" height="1024"></canvas>
+    <div id="bm-hint">点选地图任意位置作为目的地</div>
+    <div class="bm-actions">
+      <button id="btn-nav-cancel-route">✕ 取消导航</button>
+      <button id="btn-nav-go" disabled>🧭 开始导航</button>
+      <button id="btn-bigmap-close">关闭</button>
+    </div>
+  </div>
+
+  <!-- 提示 toast -->
+  <div id="toast" style="display:none"></div>
+  <!-- 高速晕影 -->
+  <div id="vignette"></div>
+
+  <!-- 结算面板 -->
+  <div id="result" class="overlay" style="display:none">
+    <div class="title-block">
+      <h2 id="res-title">完成！</h2>
+    </div>
+    <p id="res-line"></p>
+    <div class="menu-btns">
+      <button id="btn-restart">🔄 再来一次</button>
+      <button id="btn-roam">🗺 返回漫游</button>
+      <button id="btn-menu2">🏠 回主菜单</button>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

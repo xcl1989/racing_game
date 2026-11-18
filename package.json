@@ -1,0 +1,31 @@
+{
+  "scripts": {
+    "test": "node tests/test_events.mjs",
+    "test:auto": "node tests/test_auto.mjs",
+    "test:city": "node tests/test_city.mjs",
+    "test:car": "node tests/test_car_realtime.mjs",
+    "test:tesla": "node tests/test_tesla_drive.mjs",
+    "test:tesla:mobile": "node tests/test_tesla_mobile.mjs",
+    "test:porsche": "node tests/test_porsche_drive.mjs",
+    "model:simplify": "node tools_simplify.mjs",
+    "model:splitwheels": "node tools_split_wheels.mjs",
+    "test:minimap": "node tests/test_minimap.mjs",
+    "test:weather": "node tests/test_weather.mjs",
+    "test:map": "node tests/test_map_probe.mjs",
+    "test:v211": "node tests/test_v211.mjs",
+    "test:water": "node tests/test_water.mjs",
+    "test:cars": "node tests/test_new_cars.mjs",
+    "test:cars:drive": "node tests/test_new_cars_drive.mjs",
+    "probe:orientation": "node tests/probe_orientation.mjs",
+    "probe:paint": "node tests/probe_paint_ui.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.17.0"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.5.1",
+    "@gltf-transform/functions": "^4.5.1",
+    "draco3dgltf": "^1.5.9",
+    "meshoptimizer": "^1.3.0"
+  }
+}

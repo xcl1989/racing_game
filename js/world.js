@@ -1,13 +1,30 @@
-// world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线
+// world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线 / 国道 / 盘山公路
 import * as THREE from 'three';
-import { makeAsphaltTextures, makeGrassTexture, makeWindowsTexture, makeWaterNormal } from './textures.js';
+import {
+  makeAsphaltTextures, makeLaneTextures, makeHighwayTextures,
+  makeGrassTexture, makeWaterNormal, makeDirtTextures,
+  makeFacadeTexture, makeFacadeEmissive, makeGlassTexture,
+} from './textures.js';
+import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
 
-// 通用道路带状网格构建：pts 含 y（桥面抬升用）
-function ribbon(pts, closed, width, matOpts = {}) {
+// 通用道路带状网格构建：pts 含 y（桥面/山路抬升用）
+// tex: 0=街道沥青 1=窄巷（无双黄线）2=高速四车道 3=土路（野径）
+// matOpts.follow = 侧点贴地形偏移量（v2.14.3）：坡地路段路面左右两边各自采样地形高度，
+// 避免"横向平直路面在坡上一侧悬空"（野径/湖西环路过湖盆坡带时的悬空路）
+let terrainSampler = null; // buildWorld 烘焙地形后注入（ribbon 在模块顶层，作用域隔离）
+// v2.21：全路网材质注册表 —— realism.js setRoadWet() 按天气湿滑系数改 roughness/envMap
+export const roadMaterials = [];
+function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   const curve = new THREE.CatmullRomCurve3(pts, closed, 'catmullrom', 0.5);
-  const SEG = Math.max(64, Math.floor(curve.getLength() / 8));
-  const asphalt = makeAsphaltTextures();
+  // v2.28b: segLen 可调采样密度（默认 8m）。山地 follow 路必须细于地形网格（21m）——
+  // 粗弦线在凸形路段会被地形三角刺穿（凸包差 >0.1m 抬升），细到 3m 弦线即面内精确细化
+  const SEG = Math.max(64, Math.floor(curve.getLength() / (matOpts.segLen ?? 8)));
+  const asphalt = tex === 1 ? makeLaneTextures()
+    : tex === 2 ? makeHighwayTextures()
+    : tex === 3 ? makeDirtTextures()
+    : makeAsphaltTextures();
   const verts = [], uvs = [], idx = [];
+  const edgeL = [], edgeR = []; // v2.23: 左右路缘高度（缘石随横向坡度贴合）
   let dist = 0, prev = null;
   const up = new THREE.Vector3(0, 1, 0);
   for (let i = 0; i <= SEG; i++) {
@@ -20,10 +37,16 @@ function ribbon(pts, closed, width, matOpts = {}) {
     prev = p;
     const L = p.clone().addScaledVector(side, width / 2);
     const R = p.clone().addScaledVector(side, -width / 2);
-    verts.push(L.x, L.y, L.z, R.x, R.y, R.z);
-    const v = dist / 6;
-    uvs.push(0, v, 1, v);
-    if (i < SEG) {
+    let Ly = p.y, Ry = p.y;
+    if (matOpts.follow !== undefined && terrainSampler) {
+      // 侧点独立贴地：左右各自采样高度，路面横向随坡起伏不悬空
+      Ly = Math.max(matOpts.minY ?? 0.03, terrainSampler(L.x, L.z) + matOpts.follow);
+      Ry = Math.max(matOpts.minY ?? 0.03, terrainSampler(R.x, R.z) + matOpts.follow);
+    }
+    verts.push(L.x, Ly, L.z, R.x, Ry, R.z);
+    edgeL.push(Ly); edgeR.push(Ry);
+    const v = dist / 12; // v2.21.1: 1 v 单位 = 12m（标线物理比例：高速虚线画 3m/空 9m）
+    uvs.push(0, v, 1, v);    if (i < SEG) {
       const a = i * 2;
       idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
     }
@@ -33,26 +56,82 @@ function ribbon(pts, closed, width, matOpts = {}) {
   g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   g.setIndex(idx);
   g.computeVertexNormals();
-  const map = asphalt.map.clone();
-  map.needsUpdate = true;
-  map.repeat.set(1, 1);
-  const normal = asphalt.normal.clone();
-  normal.needsUpdate = true;
-  const roughTex = asphalt.roughness.clone();
-  roughTex.needsUpdate = true;
+  // v2.21：贴图工厂已单例化（make*Textures 内部缓存），直接共享实例不再 clone
+  //（repeat 恒 (1,1)，旧 clone 是每路独立 GPU 纹理 —— 1024px 时代共享反而省 20 份显存）
+  const map = asphalt.map;
+  const normal = asphalt.normal;
+  // 土路贴图仍可能无粗糙度图 → 回退纯粗糙度
+  const roughTex = asphalt.roughness || null;
+  const matOpts2 = { ...matOpts };
+  if (roughTex) matOpts2.roughnessMap = roughTex; // 不传 undefined（THREE 会告警）
   const mat = new THREE.MeshStandardMaterial({
     map, normalMap: normal, normalScale: new THREE.Vector2(0.7, 0.7),
-    roughnessMap: roughTex,
-    roughness: 0.92, metalness: 0.04, envMapIntensity: 0.5, ...matOpts,
+    roughness: 0.92, metalness: 0.04, envMapIntensity: 0.5, ...matOpts2,
   });
-  const mesh = new THREE.Mesh(g, mat);
-  mesh.receiveShadow = true;
+  roadMaterials.push(mat); // 注册进湿路反射系统（realism.js setRoadWet）
+  const roadMesh = new THREE.Mesh(g, mat);
+  roadMesh.receiveShadow = true;
   const samples = [];
   for (let i = 0; i <= SEG; i++) {
     const t = i / SEG;
     const p = curve.getPointAt(t);
     const tan = curve.getTangentAt(t).setY(0).normalize();
-    samples.push({ pos: p, tan, side: up.clone().cross(tan).normalize() });
+    // v2.27 samples 附带路宽：导航引导线按车道偏移（nav.js 消费）
+    samples.push({ pos: p, tan, side: up.clone().cross(tan).normalize(), w: width });
+  }
+
+  // v2.23 路缘石：沥青路两侧混凝土缘石（顶/内/外三面），道路立体感的最大单一元素。
+  // 土路（tex=3）不装；高处路（盘山 44m）不装——远看是悬在山脊线上空的细亮条。
+  // 截面 4 点：内底(路面)/内顶(+0.1)/外顶/外底(-0.06 撇入草地)
+  let mesh;
+  let edgeMax = 0;
+  for (let i = 0; i <= SEG; i++) {
+    if (Number.isFinite(edgeL[i])) edgeMax = Math.max(edgeMax, edgeL[i]);
+    if (Number.isFinite(edgeR[i])) edgeMax = Math.max(edgeMax, edgeR[i]);
+  }
+  if (tex !== 3 && edgeMax <= 15) {
+    const CH = 0.10, CW = 0.3;           // 缘石高/宽
+    const cv = [], cidx = [];
+    for (let sd = 0; sd < 2; sd++) {
+      const sgn = sd === 0 ? 1 : -1;
+      const eh = sd === 0 ? edgeL : edgeR;
+      for (let i = 0; i <= SEG; i++) {
+        const s = samples[i];
+        const y = Number.isFinite(eh[i]) ? eh[i] : (i > 0 ? eh[i - 1] : 0.02); // NaN 防御：回退前截面
+        const px = s.pos.x + s.side.x * sgn * (width / 2);
+        const pz = s.pos.z + s.side.z * sgn * (width / 2);
+        const ox = s.pos.x + s.side.x * sgn * (width / 2 + CW);
+        const oz = s.pos.z + s.side.z * sgn * (width / 2 + CW);
+        cv.push(
+          px, y + 0.01, pz,       // 0 内底
+          px, y + 0.01 + CH, pz,  // 1 内顶
+          ox, y + 0.01 + CH, oz,  // 2 外顶
+          ox, y - 0.06, oz        // 3 外底（微沉入草地）
+        );
+      }
+      const base = sd * (SEG + 1) * 4;
+      for (let i = 0; i < SEG; i++) {
+        const a = base + i * 4, b = base + (i + 1) * 4;
+        // 顶(a1,b1,b2) 内(a0,b0,b1) 外(b3,b2,a3) —— DoubleSide 不挑绕向
+        cidx.push(a + 1, b + 1, b + 2, a + 1, b + 2, a + 2);
+        cidx.push(a, b, b + 1, a, b + 1, a + 1);
+        cidx.push(b + 3, b + 2, a + 3, a + 3, b + 2, a + 2);
+      }
+    }
+    const cg = new THREE.BufferGeometry();
+    cg.setAttribute('position', new THREE.Float32BufferAttribute(cv, 3));
+    cg.setIndex(cidx);
+    cg.computeVertexNormals();
+    const curb = new THREE.Mesh(cg, new THREE.MeshStandardMaterial({
+      color: 0xa6a9ad, roughness: 0.95, metalness: 0,
+      side: THREE.DoubleSide,
+    }));
+    curb.receiveShadow = true;
+    curb.castShadow = true;
+    mesh = new THREE.Group();
+    mesh.add(roadMesh, curb);
+  } else {
+    mesh = roadMesh;
   }
   return { mesh, curve, samples, length: curve.getLength() };
 }
@@ -60,6 +139,8 @@ function ribbon(pts, closed, width, matOpts = {}) {
 export function buildWorld(scene) {
   const group = new THREE.Group();
   scene.add(group);
+  const beaconBlinks = [];                    // 地标塔顶警示灯
+  let eastConnPts, eastConnRoad, southConnPts, southConnRoad;
 
   // ---- 高速公路：外环大 Oval（中心 600,150，长轴 1250 / 短轴 950）----
   // ⚠️ 抬高 2cm：与草地大圆盘(y=0)共面会全程 Z-fighting 闪烁
@@ -72,7 +153,7 @@ export function buildWorld(scene) {
       150 + Math.sin(a) * 950 + Math.cos(a * 2) * 70
     ));
   }
-  const highway = ribbon(hPts, true, 20);
+  const highway = ribbon(hPts, true, 20, {}, 2); // 四车道贴图
   group.add(highway.mesh);
 
   // ---- 城市街区路网（中心 1050,350）----
@@ -101,6 +182,28 @@ export function buildWorld(scene) {
     cityStreets.push({ ax: xs[0] - 6, az: sz, bx: xs[4] + 6, bz: sz, width: 12 });
   }
 
+  // ---- 次级巷道：主街网格正中间穿插（路网加密，交叉仍是规矩的十字/T 形）----
+  // ⚠️ 高度 0.018：介于纵街(0.012)/横街(0.026)之间，重叠区高差 ≥6mm 防远距 Z-fighting
+  const Y_LANE = 0.018;
+  const laneXs = [870, 990, 1110, 1230]; // 主街间距 120 的中点
+  const laneZs = [155, 285, 415, 545];   // 主街间距 130 的中点
+  for (const sx of laneXs) {
+    const r = ribbon(
+      [new THREE.Vector3(sx, Y_LANE, zs[0] - 6), new THREE.Vector3(sx, Y_LANE, zs[4] + 6)],
+      false, 9, { roughness: 0.95 }, 1
+    );
+    group.add(r.mesh);
+    cityStreets.push({ ax: sx, az: zs[0] - 6, bx: sx, bz: zs[4] + 6, width: 9 });
+  }
+  for (const sz of laneZs) {
+    const r = ribbon(
+      [new THREE.Vector3(xs[0] - 6, Y_LANE, sz), new THREE.Vector3(xs[4] + 6, Y_LANE, sz)],
+      false, 9, { roughness: 0.95 }, 1
+    );
+    group.add(r.mesh);
+    cityStreets.push({ ax: xs[0] - 6, az: sz, bx: xs[4] + 6, bz: sz, width: 9 });
+  }
+
   // 城市行驶路线（NPC 环线）：只保留曲线供车流使用，不铺实体路面
   // —— 旧版沿街再铺一条 2.6cm 高的路，与街道长距离平行共面会闪
   const Y_ROUTE = 0.03;
@@ -118,6 +221,329 @@ export function buildWorld(scene) {
   ];
   const cityRoute = ribbon(cityRoutePts, true, 12);
   // 不 add(cityRoute.mesh)：路线隐于街道之下，车流直接"开在"街道上
+
+  // ---- 高速连接大道：城市 ↔ 高速的匝道风格直线接入 ----
+  // 动态采样高速样条找最近点；端点伸过高速中线 4m 保证无缝衔接且不戳出对侧
+  // ⚠️ 高度 0.04：高于高速(0.02)/横街(0.026)，重叠区高差足够防远距 Z-fighting
+  const extraRoadPolys = [];
+  const Y_CONN = 0.04;
+  function nearestCurvePoint(curve, tx, tz, filter) {
+    let bp = null, bd = Infinity;
+    for (let i = 0; i <= 400; i++) {
+      const p = curve.getPointAt(i / 400);
+      if (filter && !filter(p)) continue;
+      const d = (p.x - tx) ** 2 + (p.z - tz) ** 2;
+      if (d < bd) { bd = d; bp = p; }
+    }
+    return bp;
+  }
+  {
+    const hp = nearestCurvePoint(highway.curve, 1500, 350, (p) => p.x > 1400);
+    const eastPts = [
+      new THREE.Vector3(xs[4] + 6, Y_CONN, 350),
+      new THREE.Vector3(1420, Y_CONN, 352),
+      new THREE.Vector3(1560, Y_CONN, 350 + (hp.z - 350) * 0.45),
+      new THREE.Vector3(hp.x - 22, Y_CONN, hp.z),
+      new THREE.Vector3(hp.x - 4, Y_CONN, hp.z),
+    ];
+    const eastConn = ribbon(eastPts, false, 14, { roughness: 0.9 });
+    group.add(eastConn.mesh);
+    eastConnPts = eastPts; eastConnRoad = eastConn;
+  }
+  {
+    const hp = nearestCurvePoint(highway.curve, 800, 1000, (p) => p.z > 700);
+    const southPts = [
+      new THREE.Vector3(1050, Y_CONN, zs[4] + 6),
+      new THREE.Vector3(1000, Y_CONN, 700),
+      new THREE.Vector3(920, Y_CONN, 830),
+      new THREE.Vector3(850, Y_CONN, 950),
+      new THREE.Vector3(hp.x + 20, Y_CONN, hp.z - 4),
+      new THREE.Vector3(hp.x + 4, Y_CONN, hp.z),
+    ];
+    const southConn = ribbon(southPts, false, 14, { roughness: 0.9 });
+    group.add(southConn.mesh);
+    southConnPts = southPts; southConnRoad = southConn;
+  }
+
+  // ---- 城市北大道（v2.13）：城市北出口 ↔ 高速东北段，补齐城市四向出口 ----
+  // 起点东挪 30m（x=1080）与南连接大道起点错开，避免同点出发共面搭接
+  let northConnPts, northConnRoad;
+  {
+    const hp = nearestCurvePoint(highway.curve, 1250, 900, (p) => p.z > 760);
+    northConnPts = [
+      new THREE.Vector3(1080, Y_CONN, zs[4] + 6),
+      new THREE.Vector3(1105, Y_CONN, 700),
+      new THREE.Vector3(1160, Y_CONN, 790),
+      new THREE.Vector3(1220, Y_CONN, hp.z - 40),
+      new THREE.Vector3(hp.x + 18, Y_CONN, hp.z - 8),
+      new THREE.Vector3(hp.x + 4, Y_CONN, hp.z),
+    ];
+    northConnRoad = ribbon(northConnPts, false, 14, { roughness: 0.9 });
+    group.add(northConnRoad.mesh);
+  }
+
+  // ---- 湖滨路：城市南出口 → 湖畔环岛（把玩家引向湖景的休闲小路）----
+  // 湖心 (660,-560) r140（scenery 同步此坐标），环岛距水线 189m 不入水
+  const Y_LAKE = 0.02;
+  const lakeRoadPts = [
+    new THREE.Vector3(930, Y_LAKE, zs[4] + 2),  // 起点：压进横街边缘 4m 无缝衔接
+    new THREE.Vector3(890, Y_LAKE, 380),
+    new THREE.Vector3(850, Y_LAKE, 60),
+    new THREE.Vector3(830, Y_LAKE, -240),
+    new THREE.Vector3(822, Y_LAKE, -380),
+    new THREE.Vector3(820, Y_LAKE, -402),       // 端点扎进环岛圈带内
+  ];
+  const lakeRoad = ribbon(lakeRoadPts, false, 8, { color: 0x9a9184, roughness: 1 });
+  group.add(lakeRoad.mesh);
+  // 环岛：闭合圆环（高于接入路 12mm 防共面闪烁）
+  const roundPts = [];
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    roundPts.push(new THREE.Vector3(
+      820 + Math.cos(a) * 20, 0.032,
+      -420 + Math.sin(a) * 20
+    ));
+  }
+  const roundabout = ribbon(roundPts, true, 8, { color: 0x9a9184, roughness: 1 });
+  group.add(roundabout.mesh);
+  extraRoadPolys.push(lakeRoadPts.map((p) => [p.x, p.z]), roundPts.map((p) => [p.x, p.z]));
+
+  // ---- 地标电视塔（城市东北天际线，观测舱 + 天线）----
+  {
+    const towerMat = new THREE.MeshStandardMaterial({ color: 0xd7dbe0, roughness: 0.5, metalness: 0.35 });
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 5.5, 96, 12), towerMat);
+    shaft.position.set(1350, 48, 60);
+    shaft.castShadow = true;
+    group.add(shaft);
+    const pod = new THREE.Mesh(new THREE.CylinderGeometry(8.5, 6.5, 9, 14), towerMat);
+    pod.position.set(1350, 101, 60);
+    pod.castShadow = true;
+    group.add(pod);
+    const deck = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, 1.2, 14),
+      new THREE.MeshStandardMaterial({ color: 0x8a939e, roughness: 0.4, metalness: 0.5 }));
+    deck.position.set(1350, 106.5, 60);
+    group.add(deck);
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.6, 34, 6), towerMat);
+    antenna.position.set(1350, 124, 60);
+    group.add(antenna);
+    const beacon = new THREE.Mesh(new THREE.SphereGeometry(1.2, 10, 10),
+      new THREE.MeshStandardMaterial({ color: 0x330000, emissive: 0xff2020, emissiveIntensity: 1.8 }));
+    beacon.position.set(1350, 141.5, 60);
+    group.add(beacon);
+    const beaconBlink = { mesh: beacon };
+    beaconBlinks.push(beaconBlink);
+  }
+
+  // ---- 国道：城市西出口 → 绕主赛道北侧 → 西行走廊 → 接入乡道闭环 ----
+  // 让 城市↔乡道（含跨河桥）↔高速 全部连通，打破"各自为政"的割裂感
+  // ⚠️ 走高速西侧走廊（x -700~-722），距高速西端 (-650,220) 最近 ~45m 不搭接
+  const natPts = [
+    new THREE.Vector3(810, 0.032, 350),   // 城市西出口：压横街(z=350)下 6mm
+    new THREE.Vector3(640, 0.032, 356),
+    new THREE.Vector3(430, 0.032, 398),
+    new THREE.Vector3(180, 0.032, 448),
+    new THREE.Vector3(-90, 0.032, 462),
+    new THREE.Vector3(-330, 0.032, 438),
+    new THREE.Vector3(-540, 0.032, 384),
+    new THREE.Vector3(-660, 0.032, 300),
+    new THREE.Vector3(-710, 0.032, 180),
+    new THREE.Vector3(-720, 0.032, 90),
+    new THREE.Vector3(-722, 0.032, 52),   // 终点扎进乡道路面（乡道中心线 z≈52）
+  ];
+  const national = ribbon(natPts, false, 12, { roughness: 0.88 });
+  group.add(national.mesh);
+  extraRoadPolys.push(natPts.map((p) => [p.x, p.z]));
+
+  // ---- 程序化山体（北海道纳尔）+ 盘山公路 + 山顶环岛 ----
+  // 地形 = 解析高度场：terrainH 同时供路面取样、车物理 heightAt、山体网格、植被贴地
+  // 山顶压平 44m 半径平台放环岛；外缘 90m 羽化到 0 与草地无缝衔接
+  const MT = { x: 350, z: -1380, H: 72, SIG: 300, R: 520 };
+  function mountainH(x, z) {
+    const d = Math.hypot(x - MT.x, z - MT.z);
+    if (d > MT.R) return 0;
+    let fade = Math.min(1, (MT.R - d) / 90);
+    fade = fade * fade * (3 - 2 * fade);
+    let h = MT.H * Math.exp(-((d / MT.SIG) ** 2)) * fade;
+    if (d < 64) { // 山顶平台：环岛区域压平（≈70.5m），44→64 平滑过渡
+      const plat = MT.H * Math.exp(-((44 / MT.SIG) ** 2));
+      let k = Math.min(1, Math.max(0, (64 - d) / 20));
+      k = k * k * (3 - 2 * k);
+      h = plat * k + h * (1 - k);
+    }
+    return h;
+  }
+  // 水文下切（v2.12）：河道/湖盆 = 负高度，让水面真正低于地面
+  // 剖面：inner 内全深 → inner..outer smoothstep 回升到 0（自然斜坡两岸）
+  function cutBand(adx, inner, outer, depth) { // 河道：按 |x-河心|
+    if (adx > outer) return 0;
+    if (adx < inner) return -depth;
+    const t = (adx - inner) / (outer - inner);
+    return -depth * (1 - t * t * (3 - 2 * t));
+  }
+  function cutRadial(x, z, cx, cz, inner, outer, depth) { // 湖盆：按距湖心半径
+    const d = Math.hypot(x - cx, z - cz);
+    if (d > outer) return 0;
+    if (d < inner) return -depth;
+    const t = (d - inner) / (outer - inner);
+    return -depth * (1 - t * t * (3 - 2 * t));
+  }
+  // 完整地形：山体 + 河道 + 湖盆（scenery 地面网格与车物理共用）
+  function terrainH(x, z) {
+    let h = mountainH(x, z);
+    // 河道（纵贯 x=-900，z ±1700 端部渐隐成旱沟尾；坡度收紧让下切读得出来）
+    const zf = Math.max(0, Math.min(1, (1700 - Math.abs(z)) / 120));
+    h += cutBand(Math.abs(x + 900), 20, 60, 2.2) * zf;
+    // 湖1（湖东野径贴岸：盆缘 132-152 缓坡——坡带必须远宽于 43m 地面网格间距，否则插值岸坡错位）
+    h += cutRadial(x, z, 660, -560, 132, 152, 1.7);
+    // 湖2（山脚湖）
+    h += cutRadial(x, z, -1500, -1900, 176, 215, 1.8);
+    return h;
+  }
+
+  // ---- v2.12.2 物理/视觉同源烘焙 ----
+  // 渲染地面是 5200 尺寸 120x120 位移网格（顶点间距 43.3m，三角形插值），
+  // 解析 terrainH 的 10-18m 陡岸坡在网格上采不到 → 车按解析高度沉进"视觉草地"（草地落水 bug）。
+  // 解法：把 terrainH 烘到同一网格。
+  // ---- v2.28 可视面同源采样（盘山路修复的根） ----
+  // 旧版两层偏差叠加导致"路被山面埋没 + 车陷进地里"（用户实机报告）：
+  //   ① heightAt 双线性插值 ≠ 5200 平面的三角插值（反对角线 a-b-d / b-c-d）→ 坡地差 ±0.2m
+  //   ② 山体网格直接用解析 terrainH，与烘焙场最多差 ~0.5m → 山脚尾段草地平面反超山面（绿平面切山），
+  //      山腰段山面反超烘焙场 → 盘山路被埋、车陷半轮
+  // 统一原则：物理高度 = 渲染面高度。samplePlane（5200 平面精确高度）/ sampleMountain（21m 山面
+  // 网格精确高度，含边缘 150m 渐隐微抬防共面）；ribbon follow 与 heightAt 全部消费这两支。
+  const G_SEG = 120, G_SIZE = 5200, G_HALF = G_SIZE / 2;
+  const G_STEP = G_SIZE / G_SEG;
+  const terrainGrid = new Float32Array((G_SEG + 1) * (G_SEG + 1));
+  for (let j = 0; j <= G_SEG; j++) {
+    for (let i = 0; i <= G_SEG; i++) {
+      terrainGrid[j * (G_SEG + 1) + i] = terrainH(-G_HALF + i * G_STEP, -G_HALF + j * G_STEP);
+    }
+  }
+  function sampleTerrain(x, z) { // 双线性插值（越界钳到边缘）——保留供 tests/植被用，物理不再直接消费
+    const fx = Math.min(G_SEG - 1e-4, Math.max(0, (x + G_HALF) / G_STEP));
+    const fz = Math.min(G_SEG - 1e-4, Math.max(0, (z + G_HALF) / G_STEP));
+    const i = Math.floor(fx), j = Math.floor(fz), tx = fx - i, tz = fz - j;
+    const S = G_SEG + 1;
+    const h00 = terrainGrid[j * S + i], h10 = terrainGrid[j * S + i + 1];
+    const h01 = terrainGrid[(j + 1) * S + i], h11 = terrainGrid[(j + 1) * S + i + 1];
+    return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
+  }
+  // 5200 地面网格的三角插值高度 = 渲染草地面的真实高度（反对角线，与 PlaneGeometry 一致）
+  function samplePlane(x, z) {
+    const fx = Math.min(G_SEG - 1e-4, Math.max(0, (x + G_HALF) / G_STEP));
+    const fz = Math.min(G_SEG - 1e-4, Math.max(0, (z + G_HALF) / G_STEP));
+    const i = Math.floor(fx), j = Math.floor(fz), tx = fx - i, tz = fz - j;
+    const S = G_SEG + 1;
+    const a = terrainGrid[j * S + i],        // (i,j)
+      b = terrainGrid[(j + 1) * S + i],      // (i,j+1)
+      c = terrainGrid[(j + 1) * S + i + 1],  // (i+1,j+1)
+      d = terrainGrid[j * S + i + 1];        // (i+1,j)
+    if (tx + tz <= 1) return a + (d - a) * tx + (b - a) * tz;
+    const u = 1 - tx, v = 1 - tz;
+    return c + (b - c) * u + (d - c) * v;
+  }
+  // 山体可视网格：21m 顶点 = samplePlane + mtnLift（方框边缘 150m 渐隐到 0，与草地平面无缝）
+  const M_SEG = 52, M_HALF = 540, M_STEP = (M_HALF * 2) / M_SEG;
+  function mtnLift(x, z) {
+    const ex = Math.min(x - (MT.x - M_HALF), (MT.x + M_HALF) - x);
+    const ez = Math.min(z - (MT.z - M_HALF), (MT.z + M_HALF) - z);
+    const t = Math.min(1, Math.max(0, Math.min(ex, ez) / 150));
+    return 0.05 * t * t * (3 - 2 * t);
+  }
+  const mGrid = new Float32Array((M_SEG + 1) * (M_SEG + 1));
+  for (let j = 0; j <= M_SEG; j++) {
+    for (let i = 0; i <= M_SEG; i++) {
+      const x = MT.x - M_HALF + i * M_STEP, z = MT.z - M_HALF + j * M_STEP;
+      mGrid[j * (M_SEG + 1) + i] = samplePlane(x, z) + mtnLift(x, z);
+    }
+  }
+  function sampleMountain(x, z) { // 山体网格的三角插值高度 = 渲染山面的真实高度
+    if (Math.abs(x - MT.x) >= M_HALF || Math.abs(z - MT.z) >= M_HALF) return samplePlane(x, z);
+    const fx = Math.min(M_SEG - 1e-4, Math.max(0, (x - (MT.x - M_HALF)) / M_STEP));
+    const fz = Math.min(M_SEG - 1e-4, Math.max(0, (z - (MT.z - M_HALF)) / M_STEP));
+    const i = Math.floor(fx), j = Math.floor(fz), tx = fx - i, tz = fz - j;
+    const S = M_SEG + 1;
+    const a = mGrid[j * S + i], b = mGrid[(j + 1) * S + i],
+      c = mGrid[(j + 1) * S + i + 1], d = mGrid[j * S + i + 1];
+    if (tx + tz <= 1) return a + (d - a) * tx + (b - a) * tz;
+    const u = 1 - tx, v = 1 - tz;
+    return c + (b - c) * u + (d - c) * v;
+  }
+  const inMtnSq = (x, z) => Math.abs(x - MT.x) < M_HALF && Math.abs(z - MT.z) < M_HALF;
+  function groundSampler(x, z) { // 可视地面统一入口：山框内=山面，框外=草地平面
+    return inMtnSq(x, z) ? sampleMountain(x, z) : samplePlane(x, z);
+  }
+  terrainSampler = groundSampler; // 烘焙完成后向模块级 ribbon 注入采样器（follow 贴地路贴可视面）
+  {
+    // 山体网格渲染：顶点直接吃 mGrid（与 sampleMountain/物理严格一致），反对角线三角化
+    const verts = [], cols = [], idx = [];
+    const cGrass = [1, 1, 1], cRock = [0.58, 0.56, 0.54], cSnow = [0.93, 0.95, 1.0];
+    for (let j = 0; j <= M_SEG; j++) {
+      for (let i = 0; i <= M_SEG; i++) {
+        const x = MT.x - M_HALF + i * M_STEP, z = MT.z - M_HALF + j * M_STEP;
+        const h = mGrid[j * (M_SEG + 1) + i];
+        verts.push(x, h, z);
+        // 按海拔配色：低=草地纹理原色 → 岩灰 → 雪白
+        let c;
+        if (h < 14) c = cGrass;
+        else if (h < 34) { // 14-34 绿→岩渐变
+          const t = (h - 14) / 20;
+          c = cGrass.map((v, k) => v * (1 - t) + cRock[k] * t);
+        } else if (h < 52) c = cRock;
+        else { // 52-70 岩→雪渐变
+          const t = Math.min(1, (h - 52) / 16);
+          c = cRock.map((v, k) => v * (1 - t) + cSnow[k] * t);
+        }
+        cols.push(...c);
+      }
+    }
+    const W = M_SEG + 1;
+    for (let j = 0; j < M_SEG; j++) {
+      for (let i = 0; i < M_SEG; i++) {
+        const a = j * W + i, b = a + 1, c2 = a + W, d2 = c2 + 1;
+        idx.push(a, c2, b, b, c2, d2);
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    const mtMesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+      map: makeGrassTexture(24), vertexColors: true, roughness: 1, metalness: 0,
+    }));
+    mtMesh.receiveShadow = true;
+    group.add(mtMesh);
+  }
+  // 盘山公路：高速北段接入 → 螺旋上山（θ 0.84→5.84，r 400→20）→ 扎进山顶环岛
+  // v2.28: follow=0.1 —— 路缘左右各自贴可视山面（groundSampler）+0.1，横向随坡起伏不悬空不埋边；
+  // 山面在方框内 = 草地平面 + mtnLift(≤5cm)，路面恒高于山面 5cm
+  const mRoadPts = [new THREE.Vector3(690, 0.032, -870)];
+  for (let k = 1; k <= 4; k++) { // 引道：y 取 max(0.032, 可视面+0.1)，平滑过渡上山
+    const t = k / 5;
+    const x = 690 + (618 - 690) * t, z = -870 + (-1083 + 870) * t;
+    mRoadPts.push(new THREE.Vector3(x, Math.max(0.032, groundSampler(x, z) + 0.1), z));
+  }
+  for (let k = 0; k <= 46; k++) {
+    const t = k / 46;
+    const th = 0.84 + t * 5.0;
+    const r = 400 - t * 380;
+    const x = MT.x + Math.cos(th) * r, z = MT.z + Math.sin(th) * r;
+    mRoadPts.push(new THREE.Vector3(x, groundSampler(x, z) + 0.1, z));
+  }
+  const mountainRoad = ribbon(mRoadPts, false, 9, { roughness: 0.95, follow: 0.1, segLen: 3 });
+  group.add(mountainRoad.mesh);
+  extraRoadPolys.push(mRoadPts.map((p) => [p.x, p.z]));
+  // 山顶环岛（v2.28: follow=0.2 —— 高于盘山路 0.1 防共面；山顶平台已压平 → 全环等高）
+  const summitPts = [];
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    const x = MT.x + Math.cos(a) * 22, z = MT.z + Math.sin(a) * 22;
+    summitPts.push(new THREE.Vector3(x, groundSampler(x, z) + 0.2, z));
+  }
+  const summitRing = ribbon(summitPts, true, 9, { roughness: 0.95, follow: 0.2 });
+  group.add(summitRing.mesh);
+  extraRoadPolys.push(summitPts.map((p) => [p.x, p.z]));
 
   // ---- 乡间小道：西部闭环（垂直跨河的正经桥）----
   // ⚠️ 布局原则：
@@ -142,18 +568,74 @@ export function buildWorld(scene) {
     new THREE.Vector3(-620, Y_COUNTRY, -560),
     new THREE.Vector3(-640, Y_COUNTRY, -260),  // 闭合回东引道，弯道半径宽
   ];
-  const country = ribbon(cPts, true, 8, { color: 0x9a9184, roughness: 1 }); // 乡道土色
+  const country = ribbon(cPts, true, 8, { color: 0x9a9184, roughness: 1 }, 3); // 乡道：真·颠簸土路
   group.add(country.mesh);
 
-  // ---- 桥（桥面由乡道曲线 y=1.2 提供；栏杆沿 X 与桥面同向 + 桥墩在桥端）----
+  // ---- 湖东野径：单车道土路环线（绕湖一整圈，两端都咬在湖滨环岛上）----
+  // 会车要借野地；heightAt 在此路上加颠簸噪声 → 车身真实起伏
+  // ⚠️ v2.12.2 逐点贴地形铺路（sampleTerrain+0.05）：南段控制点距湖心仅 145-153，落在盆缘坡带内，
+  //    固定 y=0.044 平铺会让路面悬空、车沉到路面下（草地沉车 bug 的另一半根因）
+  const trailPts = [
+    [846, -420], [838, -480], [828, -540], [820, -610], [796, -668],
+    [752, -700], [690, -714], [628, -706], [566, -686], [524, -650],
+    [500, -600], [496, -556], [498, -505], [494, -470], [520, -448],
+    [556, -448], [600, -424], [660, -415], [700, -420], [750, -424],
+    [794, -420],
+  ];
+  const trail = ribbon(
+    trailPts.map(([x, z]) => new THREE.Vector3(x, Math.max(0.044, sampleTerrain(x, z) + 0.05), z)),
+    true, 4.5, { roughness: 1, follow: 0.05, minY: 0.044 }, 3
+  );
+  group.add(trail.mesh);
+  extraRoadPolys.push(trailPts.map(([x, z]) => [x, z]));
+
+  // ---- 湖西环路（v2.13）：高速南段 ↔ 湖滨环岛，绕湖西形成环湖通路西半环 ----
+  // ⚠️ 贴地形铺路（sampleTerrain+0.05）：南段穿过湖盆坡带外缘，固定 y 会悬空
+  let westLakePts, westLakeRoad;
+  {
+    const hp = nearestCurvePoint(highway.curve, 620, -760, (p) => p.z < -560);
+    const raw = [
+      [hp.x, hp.z],
+      [520, -740], [455, -650], [442, -545], [470, -450], [545, -378], [645, -338], [740, -348], [800, -392],
+    ];
+    westLakePts = raw.map(([x, z]) => new THREE.Vector3(x, Math.max(0.02, sampleTerrain(x, z) + 0.05), z));
+    westLakePts[0].y = hp.y + 0.03; // 端点略抬，压高速防共面
+    westLakeRoad = ribbon(westLakePts, false, 9, { color: 0x9a9184, roughness: 1, follow: 0.05, minY: 0.02 });
+    group.add(westLakeRoad.mesh);
+  }
+
+  // ---- 西南连接线（v2.13）：乡道西南段 ↔ 高速西南段，缝合西南象限路网 ----
+  // T 形接入乡道（近垂直），端点伸进高速 4m；全程平地固定 y 防搭接
+  let swLinkPts, swLinkRoad;
+  {
+    const hp = nearestCurvePoint(highway.curve, -320, -520, (p) => p.z < -380);
+    swLinkPts = [
+      new THREE.Vector3(-620, 0.032, -560),
+      new THREE.Vector3(-500, 0.032, -568),
+      new THREE.Vector3(-390, 0.032, -552),
+      new THREE.Vector3(hp.x + 20, 0.032, hp.z - 4),
+      new THREE.Vector3(hp.x + 4, 0.032, hp.z),
+    ];
+    swLinkRoad = ribbon(swLinkPts, false, 10, { roughness: 0.9 });
+    group.add(swLinkRoad.mesh);
+  }
+
+  // ---- 桥（跨下切河道：桥面 y=1.2 高出水面 2.7m；梁 + 4 桥墩入水）----
   // ⚠️ 旧版栏杆沿 Z 摆放与过河方向垂直（等于横在路中间的栅栏），已纠正
   const bridgeCenter = new THREE.Vector3(RIVER_X, 0, 60);
   const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x9aa2ab, roughness: 0.6, metalness: 0.4 });
   const railMat = new THREE.MeshStandardMaterial({ color: 0xc8ccd2, metalness: 0.7, roughness: 0.4 });
-  for (const px of [-860, -940]) { // 桥墩：桥面两端落在水面的位置
-    const pillar = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.8, 6, 8), bridgeMat);
-    pillar.position.set(px, -1, 60);
-    group.add(pillar);
+  // 主梁：桥面下的承重梁（跨河方向，顶面低于桥面 25cm 防共面）
+  const girder = new THREE.Mesh(new THREE.BoxGeometry(140, 0.7, 10), bridgeMat);
+  girder.position.set(bridgeCenter.x, 0.6, bridgeCenter.z);
+  girder.castShadow = true;
+  group.add(girder);
+  for (const px of [-865, -895, -905, -935]) { // 桥墩：立在桥面两侧水中（不入路面）
+    for (const pz of [-6.5, 6.5]) {
+      const pillar = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.8, 8, 8), bridgeMat);
+      pillar.position.set(px, -0.8, bridgeCenter.z + pz);
+      group.add(pillar);
+    }
   }
   for (const side of [-1, 1]) {
     for (const dy of [1.9, 2.3]) {
@@ -166,93 +648,214 @@ export function buildWorld(scene) {
     }
   }
 
-  // ---- 河流（纵贯蓝带：反射 + 双层滚动法线波纹）----
-  const waterNormal = makeWaterNormal();
-  const waterNormal2 = waterNormal.clone();
-  waterNormal2.needsUpdate = true;
-  waterNormal2.repeat.set(11, 11);
+  // ---- 河流（v2.24 水面材质升级：波浪/菲涅尔/泡沫 + 世界坐标岸线场）----
+  // 水线由地形反推：cutBand(|x+900|,20,60,2.2) 中 h=-1.5 处 ≈ |x+900|=34.4，
+  // 水面网格比水线略宽（76m），出界部分被抬升的地形天然遮住
+  const riverNormal = makeWaterNormal();
+  riverNormal.repeat.set(9, 404); // ~8.4m/格
   const river = new THREE.Mesh(
-    new THREE.PlaneGeometry(RIVER_W + 60, 3600),
-    new THREE.MeshStandardMaterial({
-      color: 0x2a6ea8, metalness: 0.75, roughness: 0.15,
-      normalMap: waterNormal, normalScale: new THREE.Vector2(0.35, 0.35),
-      envMapIntensity: 1.4, transparent: true, opacity: 0.94,
+    new THREE.PlaneGeometry(76, 3400, 8, 420),
+    makeWaterMaterial({
+      deep: 0x114f78, shallow: 0x2a7a8a, glint: 1.0,
+      shoreMode: 'band', center: [RIVER_X, 0], shoreR: 34.4,
+      band: 9, foamBand: 2.5, waveAmp: 0.042,
+      normalTex: riverNormal, normalScale: 0.55, repeat: 9,
     })
   );
   river.rotation.x = -Math.PI / 2;
-  river.position.set(RIVER_X, 0.04, 0);
+  river.position.set(RIVER_X, -1.5, 0);
   group.add(river);
 
-  // ---- 第二湖（山脚下：同款水波）----
+  // ---- 第二湖（山脚下：水面沉降到盆底 -1.5m；v2.24 换方形细分网格承载顶点波浪）----
+  // 水线反推：cutRadial(inner 176, outer 215, depth 1.8) 中 h=-1.5 处 ≈ d=186
+  const lake2Normal = makeWaterNormal();
+  lake2Normal.repeat.set(27, 27); // ~16m/格
   const lake2 = new THREE.Mesh(
-    new THREE.CircleGeometry(200, 40),
-    new THREE.MeshStandardMaterial({
-      color: 0x2a6ea8, metalness: 0.8, roughness: 0.12,
-      normalMap: waterNormal2, normalScale: new THREE.Vector2(0.3, 0.3),
-      envMapIntensity: 1.3,
+    new THREE.PlaneGeometry(430, 430, 64, 64),
+    makeWaterMaterial({
+      deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.9,
+      shoreMode: 'circle', center: [-1500, -1900], shoreR: 186,
+      band: 28, foamBand: 3.5, waveAmp: 0.07,
+      normalTex: lake2Normal, normalScale: 0.4, repeat: 27,
     })
   );
   lake2.rotation.x = -Math.PI / 2;
-  lake2.position.set(-1500, 0.04, -1900);
+  lake2.position.set(-1500, -1.5, -1900);
   group.add(lake2);
 
-  // ---- 城市楼房：对齐街区摆放（块内随机 1-2 栋）----
-  const N_BLD = 60;
-  const bldGeo = new THREE.BoxGeometry(1, 1, 1);
-  const bldMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff, map: makeWindowsTexture(),
-    emissiveMap: (function () {
-      const c = document.createElement('canvas');
-      c.width = 64; c.height = 128;
-      const x = c.getContext('2d');
-      x.fillStyle = '#000';
-      x.fillRect(0, 0, 64, 128);
-      for (let wy = 6; wy < 124; wy += 10) {
-        for (let wx = 5; wx < 60; wx += 10) {
-          if (Math.random() < 0.18) {
-            x.fillStyle = Math.random() < 0.5 ? '#ffe9b0' : '#fff6d8';
-            x.fillRect(wx, wy, 6, 6);
+  // ---- 城市楼房 + 街区公园 ----
+  // 巷道从街区正中穿过 → 楼房退到四象限（更小更密，城市感更强）
+  // 公园街区：四象限草坪（矩形避开巷道与主街）+ 一个水池
+  const PARK_BLOCKS = new Set(['1_2', '2_0']);
+  {
+    const bldGeo = new THREE.BoxGeometry(1, 1, 1);
+    // v2.25 楼群重制：按楼高分桶 → 每桶克隆立面贴图调 repeat，楼层高度恒定 ~3.2m
+    // （旧版一张 128px 贴图拉伸到 24~104m，楼层 3~13m 不等 + 低分辨率 = 大块模糊色块）
+    const facadeBase = makeFacadeTexture();
+    const facadeEmit = makeFacadeEmissive();
+    facadeBase.wrapS = facadeBase.wrapT = THREE.RepeatWrapping;
+    facadeEmit.wrapS = facadeEmit.wrapT = THREE.RepeatWrapping;
+    facadeBase.repeat.set(2, 1); facadeEmit.repeat.set(2, 1);
+    const N_BLD = 72;
+    // [高度区间, 基准楼高（算 repeat.y）]
+    const BLD_BUCKETS = [[[24, 46], 35], [[46, 74], 60], [[74, 110], 92]];
+    const bldBuckets = BLD_BUCKETS.map(([, hRef]) => {
+      const map = facadeBase.clone(); map.needsUpdate = true;
+      const ems = facadeEmit.clone(); ems.needsUpdate = true;
+      const ry = Math.max(2, Math.round(hRef / 12.8)); // tile = 4 层 ×3.2m
+      map.repeat.set(2, ry); ems.repeat.set(2, ry);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff, map, emissiveMap: ems,
+        emissive: 0xffdd88, emissiveIntensity: 0.35,
+        roughness: 0.85, metalness: 0.06, envMapIntensity: 0.55,
+      });
+      const mesh = new THREE.InstancedMesh(bldGeo, mat, N_BLD);
+      mesh.castShadow = true;
+      mesh.userData.cnt = 0;
+      return mesh;
+    });
+    // v2.25 玻璃幕墙塔：独立幕墙贴图（竖肋+层间带+玻璃渐变），高反射，按高度 2 桶
+    const glassBase = makeGlassTexture();
+    glassBase.wrapS = glassBase.wrapT = THREE.RepeatWrapping;
+    glassBase.repeat.set(2, 1);
+    const N_GLASS = 26;
+    const GLASS_BUCKETS = [[[40, 80], 60], [[80, 125], 100]];
+    const glassBuckets = GLASS_BUCKETS.map(([, hRef]) => {
+      const map = glassBase.clone(); map.needsUpdate = true;
+      map.repeat.set(2, Math.max(3, Math.round(hRef / 10))); // tile ≈ 3 层楼
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xdfe8ec, map, metalness: 0.55, roughness: 0.24, envMapIntensity: 1.5,
+      });
+      const mesh = new THREE.InstancedMesh(bldGeo, mat, N_GLASS);
+      mesh.castShadow = true;
+      mesh.userData.cnt = 0;
+      return mesh;
+    });
+    // 楼顶设备（空调箱/水塔）：贴楼顶的小盒子群
+    const roofGeo = new THREE.BoxGeometry(1, 1, 1);
+    const roofMat = new THREE.MeshStandardMaterial({ color: 0x9aa2ab, roughness: 0.85, metalness: 0.3 });
+    const rooftops = new THREE.InstancedMesh(roofGeo, roofMat, N_BLD * 2 + N_GLASS * 2);
+    rooftops.castShadow = true;
+    const dummy = new THREE.Object3D();
+    const tint = new THREE.Color();
+    let placed = 0, glassPlaced = 0, roofN = 0;
+    for (let bi = 0; bi < xs.length - 1; bi++) {
+      for (let bj = 0; bj < zs.length - 1; bj++) {
+        const bx = (xs[bi] + xs[bi + 1]) / 2; // 区块中心（巷道穿过）
+        const bz = (zs[bj] + zs[bj + 1]) / 2;
+        if (PARK_BLOCKS.has(`${bi}_${bj}`)) {
+          // 公园草坪：四象限矩形，中心 (bx±28, bz±30)，半宽 22/24 恰好卡进
+          // 主街内缘与巷道外缘之间（不与任何路面重叠 → 无 Z-fighting）
+          for (const sx of [-1, 1]) {
+            for (const sz of [-1, 1]) {
+              const lawn = new THREE.Mesh(
+                new THREE.PlaneGeometry(44, 48),
+                new THREE.MeshStandardMaterial({ color: 0x4f8046, roughness: 1 })
+              );
+              lawn.rotation.x = -Math.PI / 2;
+              lawn.position.set(bx + sx * 28, 0.05, bz + sz * 30);
+              lawn.receiveShadow = true;
+              group.add(lawn);
+            }
           }
+          // 公园水池（v2.24 换新水面材质：小波幅 + 岸线泡沫圈）
+          const pondNormal = makeWaterNormal();
+          pondNormal.repeat.set(2, 2);
+          const pond = new THREE.Mesh(
+            new THREE.CircleGeometry(14, 28),
+            makeWaterMaterial({
+              deep: 0x1f629a, shallow: 0x4a93b0, glint: 0.8,
+              shoreMode: 'circle', center: [bx + 28, bz + 30], shoreR: 14,
+              band: 2.5, foamBand: 1.2, waveAmp: 0.012,
+              normalTex: pondNormal, normalScale: 0.3, repeat: 2,
+            })
+          );
+          pond.rotation.x = -Math.PI / 2;
+          pond.position.set(bx + 28, 0.062, bz + 30);
+          group.add(pond);
+          continue;
+        }
+        // 楼房：象限中心 ±(26,28)，脚手印 20-32m，最多伸入巷道外缘 1.5m 余量内
+        const quads = [[-1, -1], [1, -1], [-1, 1], [1, 1]].sort(() => Math.random() - 0.5);
+        const n = 2 + (Math.random() < 0.5 ? 1 : 0);
+        for (let k = 0; k < n && placed < N_BLD; k++) {
+          const [qx, qz] = quads[k];
+          const w = 20 + Math.random() * 12;
+          const h = 24 + Math.random() * 80;
+          const dpt = 20 + Math.random() * 12;
+          dummy.position.set(
+            bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
+            bz + qz * 28 + (Math.random() - 0.5) * 5
+          );
+          dummy.scale.set(w, h, dpt);
+          dummy.rotation.y = 0;
+          dummy.updateMatrix();
+          // v2.25 按楼高入桶
+          const bucket = bldBuckets[h < 46 ? 0 : h < 74 ? 1 : 2];
+          const bi = bucket.userData.cnt;
+          if (bi < N_BLD) {
+            bucket.setMatrixAt(bi, dummy.matrix);
+            // v2.13 楼身色彩多样化：暖白/灰蓝/砖红/深灰随机域（新立面基底亮，色板更出效果）
+            const palette = [
+              [1.06, 1.04, 0.98], [0.92, 1.06, 1.18], [1.12, 0.86, 0.80],
+              [0.88, 0.90, 0.96], [1.02, 1.00, 1.06], [1.10, 1.08, 0.88],
+              [0.90, 1.02, 0.92],
+            ];
+            const pv = palette[(Math.random() * palette.length) | 0];
+            const tt = 0.66 + Math.random() * 0.5;
+            tint.setRGB(tt * pv[0], tt * pv[1], tt * pv[2]);
+            bucket.setColorAt(bi, tint);
+            bucket.userData.cnt++;
+          }
+          // 楼顶设备 1-2 件
+          const rn = 1 + (Math.random() < 0.5 ? 1 : 0);
+          for (let r = 0; r < rn && roofN < rooftops.count; r++) {
+            dummy.position.set(
+              bx + qx * 26 + (Math.random() - 0.5) * w * 0.4, h + 1.1,
+              bz + qz * 28 + (Math.random() - 0.5) * dpt * 0.4
+            );
+            dummy.scale.set(2.5 + Math.random() * 3, 2.2, 2 + Math.random() * 2.5);
+            dummy.updateMatrix();
+            rooftops.setMatrixAt(roofN++, dummy.matrix);
+          }
+          placed++;
+        }
+        // v2.13 剩余象限补玻璃幕墙塔：脚手印小 (14-22m)，天际线更立体
+        if (glassPlaced < N_GLASS && n < 4) {
+          const [qx, qz] = quads[n];
+          const w = 14 + Math.random() * 8;
+          const h = 40 + Math.random() * 85;
+          const dpt = 14 + Math.random() * 8;
+          dummy.position.set(
+            bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
+            bz + qz * 28 + (Math.random() - 0.5) * 5
+          );
+          dummy.scale.set(w, h, dpt);
+          dummy.updateMatrix();
+          const gbucket = glassBuckets[h < 80 ? 0 : 1];
+          const gi = gbucket.userData.cnt;
+          if (gi < N_GLASS) {
+            gbucket.setMatrixAt(gi, dummy.matrix);
+            const gt = 0.85 + Math.random() * 0.3;
+            tint.setRGB(gt, gt * 1.02, gt * 1.05);
+            gbucket.setColorAt(gi, tint);
+            gbucket.userData.cnt++;
+          }
+          dummy.position.set(
+            bx + qx * 26, h + 1.0, bz + qz * 28
+          );
+          dummy.scale.set(4, 2, 3);
+          dummy.updateMatrix();
+          if (roofN < rooftops.count) rooftops.setMatrixAt(roofN++, dummy.matrix);
+          glassPlaced++;
         }
       }
-      const t = new THREE.CanvasTexture(c);
-      return t;
-    })(),
-    emissive: 0xffdd88, emissiveIntensity: 0.22,
-    roughness: 0.42, metalness: 0.32, envMapIntensity: 1.0,
-  });
-  const blds = new THREE.InstancedMesh(bldGeo, bldMat, N_BLD);
-  blds.castShadow = true;
-  const dummy = new THREE.Object3D();
-  const tint = new THREE.Color();
-  let placed = 0;
-  for (let bi = 0; bi < xs.length - 1 && placed < N_BLD; bi++) {
-    for (let bj = 0; bj < zs.length - 1 && placed < N_BLD; bj++) {
-      const bx = (xs[bi] + xs[bi + 1]) / 2;
-      const bz = (zs[bj] + zs[bj + 1]) / 2;
-      const n = 1 + (Math.random() < 0.5 ? 1 : 0);
-      for (let k = 0; k < n && placed < N_BLD; k++) {
-        const w = 34 + Math.random() * 26;
-        const h = 24 + Math.random() * 80;
-        const dpt = 34 + Math.random() * 26;
-        dummy.position.set(
-          bx + (Math.random() - 0.5) * 18, h / 2,
-          bz + (Math.random() - 0.5) * 18
-        );
-        dummy.scale.set(w, h, dpt);
-        dummy.rotation.y = 0;
-        dummy.updateMatrix();
-        blds.setMatrixAt(placed, dummy.matrix);
-        const tt = 0.75 + Math.random() * 0.4;
-        tint.setRGB(tt * 1.05, tt * 1.12, tt * 1.28);
-        blds.setColorAt(placed, tint);
-        placed++;
-      }
     }
+    for (const m of bldBuckets) { m.count = m.userData.cnt; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
+    for (const m of glassBuckets) { m.count = m.userData.cnt; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
+    rooftops.count = roofN;
+    group.add(...bldBuckets, ...glassBuckets, rooftops);
   }
-  blds.count = placed;
-  blds.instanceColor.needsUpdate = true;
-  group.add(blds);
 
   // ---- 红绿灯（城市主要路口，全城同步周期）----
   const lights = [];
@@ -291,23 +894,81 @@ export function buildWorld(scene) {
       L.lamps[1].emissiveIntensity = isYellow ? 2.2 : 0.08;                // 黄
       L.lamps[2].emissiveIntensity = isGreen ? 2.2 : 0.08;                 // 绿
     }
-    // 水面波纹流动（双层反向滚动 → 干涉出自然水波）
+    // 水面动画（v2.24：water.js 统一推进波浪相位 + 法线贴图滚动）
     const t = performance.now() * 0.001;
-    if (waterNormal) {
-      waterNormal.offset.set(t * 0.012, t * 0.02);
-      waterNormal2.offset.set(-t * 0.008, t * 0.014);
-    }
+    updateWater(t);
+    // 地标塔警示灯闪烁
+    const blink = Math.sin(t * 3) > 0 ? 2.2 : 0.15;
+    for (const b of beaconBlinks) b.mesh.material.emissiveIntensity = blink;
   }
   const isRed = () => !(cycle < 10);
 
   // ---- 查询 ----
+  // 颠簸土路噪声：乡道 + 野径（确定性三频正弦，随位置变化不闪变）
+  function bumpNoise(x, z) {
+    return (Math.sin(x * 1.9) + Math.sin(z * 2.3) + Math.sin((x + z) * 1.3)) * 0.033;
+  }
+  // v2.28: follow 铺路的路面精确高度 —— 最近样本段投影 → 段上侧向偏移 → 双路缘插值。
+  // 与 ribbon 路面同式（路缘 = 可视面侧点+lift，路面 = 两缘线性插值），凸形横断面也不浮不陷。
+  // 返回 { y: 路面高, d: 到路中线距离 }，70m 外返回 null
+  function mtnRoadY(samples, lift, x, z) {
+    let bi = -1, bd = Infinity;
+    for (let i = 0; i < samples.length; i++) {
+      const dx = samples[i].pos.x - x, dz = samples[i].pos.z - z;
+      const d = dx * dx + dz * dz;
+      if (d < bd) { bd = d; bi = i; }
+    }
+    if (bi < 0 || bd > 4900) return null;
+    const hw = samples[bi].w / 2;
+    let ry = null, rd = Infinity;
+    for (const off of [-1, 1]) {
+      const j = bi + off;
+      if (j < 0 || j >= samples.length) continue;
+      const a = samples[bi].pos, b = samples[j].pos;
+      const abx = b.x - a.x, abz = b.z - a.z;
+      const L2 = abx * abx + abz * abz;
+      if (L2 < 1e-6) continue;
+      const t = Math.max(0, Math.min(1, ((x - a.x) * abx + (z - a.z) * abz) / L2));
+      const px = a.x + abx * t, pz = a.z + abz * t;
+      const d = Math.hypot(x - px, z - pz);
+      if (d < rd) {
+        rd = d;
+        const s = samples[bi].side;
+        const gL = groundSampler(px + s.x * hw, pz + s.z * hw) + lift;
+        const gR = groundSampler(px - s.x * hw, pz - s.z * hw) + lift;
+        const o = Math.max(-hw, Math.min(hw, (x - px) * s.x + (z - pz) * s.z));
+        ry = gL * (o + hw) / (2 * hw) + gR * (hw - o) / (2 * hw);
+      }
+    }
+    return ry === null ? null : { y: ry, d: rd };
+  }
   // 桥面高度：桥面沿 X 跨 x∈[-860,-940]（|dx|<40 全高 1.2，两端 30m 线性缓坡）
+  // v2.11：+ 山地地形高度场 + 土路颠簸（乡道/野径上车身真实起伏）
   function heightAt(pos) {
-    const dx = Math.abs(pos.x - bridgeCenter.x);
-    if (Math.abs(pos.z - bridgeCenter.z) < 6 && dx < 70) {
+    const x = pos.x, z = pos.z;
+    const dx = Math.abs(x - bridgeCenter.x);
+    if (Math.abs(z - bridgeCenter.z) < 6 && dx < 70) {
       return 1.2 * Math.max(0, Math.min(1, (70 - dx) / 30));
     }
-    return 0;
+    // v2.28 物理基高 = 可视地面精确高度（山框内=山面网格，框外=5200 平面三角插值）
+    // —— 视觉与物理严格同源，坡地不再悬空/下陷
+    let h = groundSampler(x, z);
+    // 盘山路/山顶环岛路面高度（follow 铺路的实际路面：路缘 4.5m 内满高，6.5m 渐出到地面）
+    if (inMtnSq(x, z)) {
+      const g = groundSampler(x, z);
+      for (const [route, lift] of [[mountainRoad, 0.1], [summitRing, 0.2]]) {
+        const v = mtnRoadY(route.samples, lift, x, z);
+        if (!v || v.d >= 6.5) continue;
+        const k = Math.max(0, Math.min(1, (6.5 - v.d) / 2)); // 路缘外 2m 渐出
+        h = Math.max(h, g + (v.y - g) * k);
+      }
+    }
+    // 土路颠簸：乡道/野径上叠加路面起伏（车身真实颠簸）
+    if (distToRouteSamples(country.samples, x, z) <= 4.5
+      || distToRouteSamples(trail.samples, x, z) <= 2.8) {
+      h += bumpNoise(x, z);
+    }
+    return h;
   }
   // 是否在城市路网 / 高速上（离路判定用）
   function distToCityRoads(x, z) {
@@ -323,10 +984,12 @@ export function buildWorld(scene) {
     return distToCityRoads(pos.x, pos.z) <= 7;
   }
 
-  // 到高速/乡道路面的粗距离（玩家离路判定用）
-  function distToRouteSamples(samples, x, z) {
+  // 到路面的距离（玩家离路判定用）
+  // ⚠️ 全采样（step=1）：旧版 i+=4 在长路上采样间隔 ~32m，玩家开在两点中间
+  //    会被误判越野（阈值 5.5/11 挡不住 16m 的采样间隙）。每帧千次距离计算可忽略
+  function distToRouteSamples(samples, x, z, step = 1) {
     let best = Infinity;
-    for (let i = 0; i < samples.length; i += 4) {
+    for (let i = 0; i < samples.length; i += step) {
       const p = samples[i].pos;
       const d = Math.hypot(x - p.x, z - p.z);
       if (d < best) best = d;
@@ -334,16 +997,92 @@ export function buildWorld(scene) {
     return best;
   }
   function onAnyRoad(pos) {
+    const x = pos.x, z = pos.z;
     return isOnCityRoad(pos)
-      || distToRouteSamples(highway.samples, pos.x, pos.z) <= 11
-      || distToRouteSamples(country.samples, pos.x, pos.z) <= 5.5;
+      || distToRouteSamples(highway.samples, x, z) <= 11
+      || distToRouteSamples(country.samples, x, z) <= 5.5
+      || distToRouteSamples(eastConnRoad.samples, x, z) <= 8.5
+      || distToRouteSamples(southConnRoad.samples, x, z) <= 8.5
+      || distToRouteSamples(lakeRoad.samples, x, z) <= 5.5
+      || distToRouteSamples(roundabout.samples, x, z) <= 5.5
+      || distToRouteSamples(national.samples, x, z) <= 7.5
+      || distToRouteSamples(mountainRoad.samples, x, z) <= 5.5
+      || distToRouteSamples(summitRing.samples, x, z) <= 5.5
+      || distToRouteSamples(trail.samples, x, z) <= 3 // 野径单车道：路缘外就是野地
+      || distToRouteSamples(westLakeRoad.samples, x, z) <= 6
+      || distToRouteSamples(northConnRoad.samples, x, z) <= 8.5
+      || distToRouteSamples(swLinkRoad.samples, x, z) <= 6.5;
+  }
+  // 路面材质查询（v2.20，越野分级用）：'dirt'=土路（乡道+野径颠簸路）/ 'pave'=铺装
+  // 野地（草地）由调用方以 null 表示——isOffroad 先判"路外"再查材质
+  function surfaceAt(pos) {
+    const x = pos.x, z = pos.z;
+    if (distToRouteSamples(country.samples, x, z) <= 5.5
+      || distToRouteSamples(trail.samples, x, z) <= 3) return 'dirt';
+    return onAnyRoad(pos) ? 'pave' : null;
   }
   function distToRoads(x, z) {
-    // 供植被/建筑生成避让：高速 + 乡道（城市街道也包含）
+    // 供植被/建筑生成避让：全部铺装+土路（城市街道也包含）
     let d = distToCityRoads(x, z);
     d = Math.min(d, distToRouteSamples(highway.samples, x, z));
     d = Math.min(d, distToRouteSamples(country.samples, x, z));
+    d = Math.min(d, distToRouteSamples(eastConnRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(southConnRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(lakeRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(roundabout.samples, x, z));
+    d = Math.min(d, distToRouteSamples(national.samples, x, z));
+    d = Math.min(d, distToRouteSamples(mountainRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(summitRing.samples, x, z));
+    d = Math.min(d, distToRouteSamples(trail.samples, x, z));
+    d = Math.min(d, distToRouteSamples(westLakeRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(northConnRoad.samples, x, z));
+    d = Math.min(d, distToRouteSamples(swLinkRoad.samples, x, z));
     return d;
+  }
+
+  // ---- 冲刺/越野赛路线（v2.32）----
+  // routeFromPoints：任意点列 → 轻量路线对象（curve+samples+length，无路面网格）；
+  // 冲刺赛从现有 ribbon 抽样切片（零建模成本），越野赛由野径 trail 横向扰动生成
+  const routeFromPoints = (pts, width, id) => {
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.35);
+    const length = curve.getLength();
+    const n = Math.max(8, Math.round(length / 8));
+    const samples = [];
+    for (let k = 0; k <= n; k++) {
+      const t = k / n;
+      const pos = curve.getPointAt(t);
+      const tan = curve.getTangentAt(t).setY(0).normalize();
+      samples.push({ pos, tan, side: new THREE.Vector3(tan.z, 0, -tan.x), w: width });
+    }
+    return { id, curve, samples, length, width,
+      startPos: samples[0].pos.clone(), endPos: samples[n].pos.clone() };
+  };
+  const sliceRoute = (ribbon, t0, t1, id) => {
+    const s = ribbon.samples;
+    const i0 = Math.floor(s.length * t0), i1 = Math.min(s.length - 1, Math.ceil(s.length * t1));
+    const pts = [];
+    for (let k = i0; k <= i1; k++) pts.push(s[k].pos.clone());
+    return routeFromPoints(pts, s[i0].w, id);
+  };
+  const sprintRoutes = {
+    highway: sliceRoute(highway, 0.03, 0.42, 'sprint_highway'),   // 高速直通段
+    canyon: sliceRoute(national, 0.0, 1.0, 'sprint_canyon'),      // 国道全段（跨河桥）
+    lakeside: sliceRoute(lakeRoad, 0.0, 1.0, 'sprint_lakeside'),  // 湖滨路全段
+  };
+  // 越野赛·湖东狂飙：沿野径取 12 点横向 ±30m 扰动进草地（点高按地形，避水回撤到野径）
+  {
+    const offs = [0, 16, 28, 20, -8, -24, -16, 4, 18, 26, 16, 0];
+    const N = 12;
+    const pts = [];
+    for (let k = 0; k < N; k++) {
+      const s = trail.samples[Math.round((k / (N - 1)) * (trail.samples.length - 1))];
+      let p = s.pos.clone().addScaledVector(s.side, offs[k]);
+      let h = sampleTerrain(p.x, p.z);
+      if (h < -0.3) { p = s.pos.clone(); h = sampleTerrain(p.x, p.z); } // 避水回撤
+      p.y = Math.max(0.05, h + 0.22);
+      pts.push(p);
+    }
+    sprintRoutes.offroad = routeFromPoints(pts, 7, 'offroad_stampede');
   }
 
   // 小地图折线（画全路网）：高速 / 城市环线 / 乡道 + 城市街道网格逐条补上
@@ -354,13 +1093,24 @@ export function buildWorld(scene) {
     cityRoutePts.map((p) => [p.x, p.z]),
     cPts.map((p) => [p.x, p.z]),
     ...streetPolys,
+    ...extraRoadPolys,
+    eastConnPts.map((p) => [p.x, p.z]),
+    southConnPts.map((p) => [p.x, p.z]),
+    northConnPts.map((p) => [p.x, p.z]),
+    westLakePts.map((p) => [p.x, p.z]),
+    swLinkPts.map((p) => [p.x, p.z]),
   ];
 
   return {
     group, highway, cityRoute, country, cityStreets,
+    eastConn: eastConnRoad, southConn: southConnRoad, northConn: northConnRoad,
+    westLake: westLakeRoad, swLink: swLinkRoad,
+    lakeRoad, roundabout, national, mountainRoad, summitRing, trail,
+    sprintRoutes,
+    terrainH, sampleTerrain, groundSampler, MT,
     lights, update, isRed,
     heightAt, isOnCityRoad, distToCityRoads,
-    onAnyRoad, distToRoads,
+    onAnyRoad, surfaceAt, distToRoads,
     minimapPolylines,
   };
 }

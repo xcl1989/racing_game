@@ -1,6 +1,8 @@
-// game.js — 游戏逻辑：模式管理 / 检查点与圈数 / 收集挑战 / HUD / 小地图
+// game.js — 游戏逻辑：模式管理 / 检查点与圈数 / 收集挑战 / HUD / 小地图 / 导航
 import * as THREE from 'three';
 import { gyroState } from './input.js';
+import { buildNavGraph, findRoute, NavGuide } from './nav.js';
+import { eventReward, markRaceResult, ODO_STEP, ODO_MIN_SPEED, ODO_FRAME_CAP } from './economy.js'; // v2.32 积分经济
 
 const LAPS_RACE = 3;
 const $ = (id) => document.getElementById(id);
@@ -14,6 +16,7 @@ export class Game {
     this.track = track; this.player = player; this.ais = ais;
     this.dust = dust; this.skids = skids; this.smoke = smoke; this.audio = audio;
     this.world = world; this.traffic = traffic;
+    this.lastRoadPos = track.startPos.clone(); // 落水拖回的兜底点（起点格）
     // 漫游时世界路网（高速/乡道/城市街道）不算越野
     this.track.worldOnRoad = (pos) => this.world.onAnyRoad(pos);
     this.mode = 'free';
@@ -23,6 +26,22 @@ export class Game {
     this.lastT = 0;
     this.crashShake = 0; // 碰撞震屏强度（随时间衰减）
     this.dismissedFor = null; // 「稍后再说」忽略的活动（驶出范围后重置）
+
+    // ---- v2.32 存档 / 积分经济（槽位由 main.js attachSave 注入）----
+    this.slotId = -1;            // 当前存档槽位（-1 = 未挂存档，测试直开兼容）
+    this.saveMgr = null;         // SaveManager 引用
+    this.carId = 'ferrari';
+    this.owned = ['ferrari'];
+    this.credits = 0;
+    this.odoTotal = 0;           // 累计里程 m
+    this.odoCarry = 0;           // <1000m 零头
+    this.bests = null;           // 槽位纪录表（null 时回退全局 rg_best_*）
+    this.raceLog = {};
+    this.playMs = 0;
+    this._sessionStart = Date.now();
+    this._autosaveT = 0;         // 自由漫游 60s 定时存档
+    this._savedPos = null;       // 比赛中不覆盖存档位置（读档点兜底）
+    this.sprint = null;          // {def, R, cursor, playerTotal, nextCp, cps, gates}
 
     // 小地图缩放档位：点击循环切换（s = 像素/米）
     this.mmZooms = [
@@ -37,11 +56,29 @@ export class Game {
     this.buildEvents();
     this.buildMinimapBase();
     this.bindUI();
-    // 点击小地图循环切换范围
-    document.getElementById('minimap').addEventListener('pointerdown', () => {
-      this.mmZoomIdx = (this.mmZoomIdx + 1) % this.mmZooms.length;
-      this.audio.beep(660, 0.08, 0.1);
+    // ---- 导航（v2.18）：路网图 + A* + 3D 流光线；长按小地图开大地图点选目的地 ----
+    this.navGraph = buildNavGraph(this.world, this.track);
+    this.navGuide = new NavGuide(this.track.gatesGroup.parent);
+    this.nav = null; // { name, dest, pts, cum, cursor, rerouteT, fallback }
+    this.buildBigMap();
+    // 小地图交互：短按=切缩放档；长按 450ms=打开导航面板
+    const mm = document.getElementById('minimap');
+    mm.addEventListener('pointerdown', () => {
+      this._mmDownAt = performance.now();
+      this._mmLp = setTimeout(() => { this._mmLp = null; this.openBigMap(); }, 450);
     });
+    const mmEnd = (fire) => {
+      if (!this._mmLp) return;
+      clearTimeout(this._mmLp);
+      this._mmLp = null;
+      if (fire && performance.now() - this._mmDownAt < 450) {
+        this.mmZoomIdx = (this.mmZoomIdx + 1) % this.mmZooms.length;
+        this.audio.beep(660, 0.08, 0.1);
+      }
+    };
+    mm.addEventListener('pointerup', () => mmEnd(true));
+    mm.addEventListener('pointercancel', () => mmEnd(false));
+    mm.addEventListener('pointerleave', () => mmEnd(false));
   }
 
   // ---- 地图活动（Forza 式光柱：开进去即可报名）----
@@ -73,6 +110,29 @@ export class Game {
         color: 0xff4455, radius: 16, pos: new THREE.Vector3(S.ax + 12, 0, S.az + 20),
       },
     ];
+    // ---- v2.32 冲刺赛 ×3 + 越野赛 ×1（Forza 式点对点）----
+    // 路线来自 world.sprintRoutes（ribbon 切片 / 野径扰动生成），零建模成本；
+    // desc 里的里程按实际路线长度生成，基础奖励文案与 economy.js 奖励表一致
+    const SR = this.world.sprintRoutes;
+    const sprintDefs = [
+      { key: 'sprint_highway', mode: 'sprint', route: SR.highway, name: '🏁 高速冲刺',
+        desc: '高速直通段 · 3 名 AI · 首胜 +30💎', color: 0xff77cc },
+      { key: 'sprint_canyon', mode: 'sprint', route: SR.canyon, name: '🏁 峡谷冲刺',
+        desc: '国道 · 跨河大桥 · 3 名 AI · 首胜 +45💎', color: 0xff77cc },
+      { key: 'sprint_lakeside', mode: 'sprint', route: SR.lakeside, name: '🏁 海滨冲刺',
+        desc: '湖滨公路 · 3 名 AI · 首胜 +40💎', color: 0xff77cc },
+      { key: 'offroad_stampede', mode: 'offroad', route: SR.offroad, name: '🌲 越野 · 湖东狂飙',
+        desc: '野地检查点拉力 · 推荐越野车 · 首胜 +60💎', color: 0x88ff44 },
+    ];
+    for (const d of sprintDefs) {
+      // 报名光柱立在起点路侧（路外 12m 不挡道）
+      const s0 = d.route.samples[0];
+      d.pos = s0.pos.clone().addScaledVector(s0.side, 12).setY(0);
+      d.radius = 16;
+      d.desc = `${(d.route.length / 1000).toFixed(1)} km · ${d.desc}`;
+      this.events.push(d);
+    }
+    this.sprintDefs = sprintDefs;
     // 光柱 + 底座光环 + 悬浮名牌
     this.eventRings = [];
     this.eventGroup = new THREE.Group();
@@ -121,6 +181,53 @@ export class Game {
     this.eventGroup.visible = false; // 仅自由漫游时可见
     scene.add(this.eventGroup);
     this.promptEvent = null;
+
+    // ---- v2.32 赛事检查点门组（每条路线独立 Group，仅该赛事进行中可见）----
+    // 门=~350m 一座：两根发光柱 + 顶横梁；终点门加旗门横幅色带
+    this.sprintGateGroups = {};
+    const gateMat = (c) => new THREE.MeshStandardMaterial({
+      color: c, emissive: c, emissiveIntensity: 1.8, metalness: 0.3, roughness: 0.4,
+    });
+    for (const d of this.sprintDefs) {
+      const g = new THREE.Group();
+      const R = d.route;
+      const nGates = Math.max(3, Math.round(R.length / 350)); // 含终点门
+      d.gateDists = []; // 各门的曲线里程（进度判定用）
+      for (let k = 1; k <= nGates; k++) {
+        const isFinish = k === nGates;
+        // 常规检查点均布至 92% 处；终点旗门压到末端 99.3%（冲线判定=全门通过）
+        const t = isFinish ? 0.993 : (k / nGates) * 0.92;
+        const p = R.curve.getPointAt(t);
+        const tan = R.curve.getTangentAt(t).setY(0).normalize();
+        const side = new THREE.Vector3(tan.z, 0, -tan.x);
+        const half = R.width / 2 + 1.6;
+        d.gateDists.push(t * R.length);
+        for (const sgn of [-1, 1]) {
+          const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 5, 8), gateMat(d.color));
+          pole.position.copy(p).addScaledVector(side, sgn * half).setY(2.5);
+          g.add(pole);
+        }
+        const beam = new THREE.Mesh(
+          new THREE.BoxGeometry(half * 2 + 0.6, 0.28, 0.28),
+          gateMat(isFinish ? 0xffdd44 : d.color)
+        );
+        beam.position.copy(p).setY(5.1);
+        beam.rotation.y = Math.atan2(tan.x, tan.z) + Math.PI / 2;
+        g.add(beam);
+        if (isFinish) { // 终点旗门横幅
+          const banner = new THREE.Mesh(
+            new THREE.BoxGeometry(half * 2, 1.1, 0.06),
+            new THREE.MeshBasicMaterial({ color: 0x111418, transparent: true, opacity: 0.85 })
+          );
+          banner.position.copy(p).setY(4.4);
+          banner.rotation.y = beam.rotation.y;
+          g.add(banner);
+        }
+      }
+      g.visible = false;
+      scene.add(g);
+      this.sprintGateGroups[d.key] = g;
+    }
   }
 
   // ---- 收集挑战：发光圆环 ----
@@ -177,13 +284,14 @@ export class Game {
       x.stroke();
     };
     const [hwPoly, cityPoly, ctryPoly] = this.world.minimapPolylines;
-    drawPoly(hwPoly, 'rgba(88,108,130,0.95)', 5);  // 高速
-    drawPoly(cityPoly, '#7fa8d9', 3);               // 城市
-    drawPoly(ctryPoly, '#c9b98a', 3);               // 乡道
+    // v2.13 道路统一灰阶（宽度分级保主次，不再五颜六色）
+    drawPoly(hwPoly, 'rgba(150,155,162,0.95)', 5);   // 高速
+    drawPoly(cityPoly, 'rgba(172,176,182,0.95)', 3); // 城市
+    drawPoly(ctryPoly, 'rgba(150,155,162,0.95)', 3); // 乡道
     for (let i = 3; i < this.world.minimapPolylines.length; i++) {
-      drawPoly(this.world.minimapPolylines[i], '#7fa8d9', 2); // 街道网格
+      drawPoly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 2); // 街道网格
     }
-    x.strokeStyle = 'rgba(255,255,255,0.95)';
+    x.strokeStyle = 'rgba(178,182,188,0.95)';
     x.lineWidth = 4;
     x.beginPath();
     this.track.samples.forEach((s, i) => {
@@ -234,20 +342,52 @@ export class Game {
       x.stroke();
     };
     const [hwPoly, cityPoly, ctryPoly] = this.world.minimapPolylines;
-    poly(hwPoly, 'rgba(88,108,130,0.95)', 20);   // 高速
-    poly(cityPoly, '#7fa8d9', 12);                // 城市
-    poly(ctryPoly, '#c9b98a', 8);                 // 乡道
+    // v2.13 道路统一灰阶（宽度分级保主次）
+    poly(hwPoly, 'rgba(150,155,162,0.95)', 20);   // 高速
+    poly(cityPoly, 'rgba(172,176,182,0.95)', 12); // 城市
+    poly(ctryPoly, 'rgba(150,155,162,0.95)', 8);  // 乡道
     for (let i = 3; i < this.world.minimapPolylines.length; i++) {
-      poly(this.world.minimapPolylines[i], '#7fa8d9', 10); // 街道网格
+      poly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 10); // 街道网格
     }
     const ST = this.track.strip;
-    poly([[ST.ax, ST.az], [ST.bx, ST.bz]], 'rgba(120,200,255,0.9)', 10); // 直线赛道
-    x.strokeStyle = 'rgba(255,255,255,0.95)';
+    poly([[ST.ax, ST.az], [ST.bx, ST.bz]], 'rgba(160,165,171,0.95)', 10); // 直线赛道
+    x.strokeStyle = 'rgba(178,182,188,0.95)';
     x.lineWidth = 8 * lwBoost;
     x.beginPath();
     this.track.samples.forEach((sm, i) => i === 0 ? x.moveTo(sm.pos.x, sm.pos.z) : x.lineTo(sm.pos.x, sm.pos.z));
     x.closePath();
     x.stroke();
+    // 导航路线高亮（v2.18；v2.27 改造）：
+    //  ① 屏幕像素恒宽（旧版用世界单位线宽，全景档 s=0.042 时只有 ~1px 几乎不可见）
+    //  ② 不闭合（closePath 会画"终点连回起点"的假边）
+    //  ③ 画在道路层之后最上层（主环道白线此前会盖住路线）
+    //  ④ 深色描边衬底：在草地/浅色路面上也有对比度
+    if (this.nav && this.mode === 'free') {
+      const navPts = this.nav.pts.map((p) => [p.x, p.z]);
+      const openPx = (pts, style, pxw) => {
+        x.strokeStyle = style;
+        x.lineWidth = pxw / s; // scale(s,s) 下除以 s → 恒定像素宽
+        x.beginPath();
+        pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
+        x.stroke();
+      };
+      openPx(navPts, 'rgba(4,26,36,0.7)', 7.5);
+      openPx(navPts, 'rgba(46,230,255,0.95)', 4.5);
+    }
+    // v2.32 冲刺/越野赛路线高亮（画法同导航：恒定像素宽 + 深色衬底 + 不闭合）
+    const spR = (this.mode === 'sprint' || this.mode === 'offroad') && this.sprint ? this.sprint.R : null;
+    if (spR) {
+      const rPts = spR.samples.map((sm) => [sm.pos.x, sm.pos.z]);
+      const openSp = (pts, style, pxw) => {
+        x.strokeStyle = style;
+        x.lineWidth = pxw / s;
+        x.beginPath();
+        pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
+        x.stroke();
+      };
+      openSp(rPts, 'rgba(4,26,36,0.7)', 7.5);
+      openSp(rPts, this.sprint.def.mode === 'offroad' ? 'rgba(136,255,68,0.95)' : 'rgba(255,119,204,0.95)', 4.5);
+    }
     x.restore();
 
     // 圆点层（屏幕空间，超出裁掉）
@@ -262,6 +402,16 @@ export class Game {
     };
     if (this.mode !== 'drag') {
       for (const ev of this.events) dot(ev.pos.x, ev.pos.z, `#${ev.color.toString(16).padStart(6, '0')}`, 4);
+    }
+    // 导航目的地旗点（v2.18）
+    if (this.nav && this.mode === 'free') {
+      const m = toScreen(this.nav.dest.x, this.nav.dest.z);
+      if (onMap(m)) {
+        const pulse = 4 + Math.sin(performance.now() / 180) * 1.2;
+        x.fillStyle = '#2ee6ff';
+        x.beginPath(); x.arc(m[0], m[1], pulse, 0, Math.PI * 2); x.fill();
+        x.strokeStyle = '#ffffff'; x.lineWidth = 1.5; x.stroke();
+      }
     }
     for (const ai of this.ais) {
       if (ai.group.visible) dot(ai.pos.x, ai.pos.z, `#${ai.color.toString(16).padStart(6, '0')}`, 3.5);
@@ -305,7 +455,7 @@ export class Game {
   }
 
   // ---- 模式启动 ----
-  startMode(mode) {
+  startMode(mode, ev = null) {
     this.mode = mode;
     // 自由漫游免倒计时直接开跑；其余模式 3.2s 倒计时
     this.state = mode === 'free' ? 'running' : 'countdown';
@@ -328,6 +478,23 @@ export class Game {
         .add(new THREE.Vector3(0, 0, 14));
       this.player.reset(p0, startYaw);
       this.dragEnd = new THREE.Vector3(S.bx, 0, S.bz);
+      this.eventGroup.visible = false;
+    } else if (mode === 'sprint' || mode === 'offroad') {
+      // ---- v2.32 冲刺/越野赛：单向路线点对点，检查点门按序通过 ----
+      const def = ev && ev.route ? ev
+        : this.sprintDefs.find((d) => d.mode === mode) || this.sprintDefs[0];
+      const R = def.route;
+      const tan0 = R.curve.getTangentAt(0).setY(0).normalize();
+      const side0 = new THREE.Vector3(tan0.z, 0, -tan0.x);
+      const lanes = mode === 'offroad' ? [-3.5, -1.2, 1.2, 3.5] : [-4, -1.4, 1.4, 4];
+      this.player.reset(R.startPos.clone().addScaledVector(side0, lanes[3]), Math.atan2(tan0.x, tan0.z));
+      // 进度游标 + 检查点里程表（按序通过，进度单调推进防倒车刷门）
+      this.sprint = {
+        def, R, cursor: 0, playerTotal: 0, nextCp: 0,
+        cps: def.gateDists, aiFinished: [null, null, null],
+      };
+      this.ais.forEach((ai, i) => ai.resetSprint(R, lanes[i]));
+      this._activeKey = def.key;
       this.eventGroup.visible = false;
     } else {
       // ★ 发车格：P1 最前，前后错列 8m + 左右交错 ±3m；AI 占 P1-P3，玩家 P4
@@ -356,33 +523,60 @@ export class Game {
     }
 
     const raceLike = mode === 'race' || mode === 'time';
-    const showAI = mode === 'race' || mode === 'free';
+    const sprintLike = mode === 'sprint' || mode === 'offroad';
+    const showAI = mode === 'race' || sprintLike; // 冲刺/越野赛 AI 同场竞技
     this.track.gatesGroup.visible = raceLike;
     this.ringGroup.visible = mode === 'collect';
     this.eventGroup.visible = mode === 'free'; // 光柱只在漫游时可见
-    // ★ 护栏仅比赛时出现（漫游自由越野，直线赛道开阔）
+    // ★ 赛事门组：只亮当前赛事的（其余全隐藏，含离开时熄灭）
+    for (const [k, g] of Object.entries(this.sprintGateGroups)) {
+      g.visible = sprintLike && this.sprint && this.sprint.def.key === k;
+    }
+    // ★ 护栏仅主环道比赛时出现（漫游自由越野，直线赛道开阔，冲刺赛跑公共路不设栏）
     if (this.track.railGroup) this.track.railGroup.visible = raceLike;
     this.ais.forEach((a) => { a.group.visible = showAI; });
+    // 自由漫游：AI 车随机相位分散到环道各处巡航（不再停在起步格"陪着"玩家）
+    if (mode === 'free') {
+      this.ais.forEach((ai) => {
+        ai.group.visible = true;
+        ai.total = Math.random() * this.track.length;
+        ai.speed = 0;
+        ai.reaction = 0.2 + Math.random() * 0.5;
+        ai.place(this.track);
+      });
+    }
     // NPC 车流只在漫游/收集时出现（比赛让路，直线赛道空旷）
     this.traffic.forEach((t) => { t.group.visible = mode === 'free' || mode === 'collect'; });
     for (const r of this.rings) r.userData.done = false;
 
     $('menu').style.display = 'none';
     $('result').style.display = 'none';
+    $('pauseMenu').style.display = 'none'; // 直调 startMode（测试）时兜底清掉暂停菜单
     $('hud').style.display = 'block';
     $('controls').style.display = 'flex';
-    // 收集挑战显示已收集数；直线加速赛复用该栏显示剩余距离
-    const infoBox = mode === 'collect' ? 'collect' : (mode === 'drag' ? 'drag' : null);
+    // 收集挑战显示已收集数；直线加速赛复用该栏显示剩余距离；冲刺赛显示检查点进度
+    const infoBox = mode === 'collect' ? 'collect'
+      : (mode === 'drag' ? 'drag' : (sprintLike ? 'cp' : null));
+    $('collect-label').textContent = infoBox === 'cp' ? '检查点'
+      : (infoBox === 'drag' ? '剩余' : '能量环');
     $('collect-box').style.display = infoBox ? 'block' : 'none';
-    $('collect-val').textContent = infoBox === 'drag' ? '760 m' : '0 / 14';
+    $('collect-val').textContent = infoBox === 'drag' ? '760 m'
+      : (infoBox === 'cp' ? `0 / ${this.sprint.cps.length}` : '0 / 14');
     $('lap-box').style.display = raceLike ? 'block' : 'none';
-    $('rank-box').style.display = mode === 'race' ? 'block' : 'none';
+    $('rank-box').style.display = mode === 'race' || sprintLike ? 'block' : 'none';
+    // v2.32：sprint 分支文案延迟取值（对象字面量会急切求值，free 模式下 sprint 为 null）
+    const defName = this.sprint ? this.sprint.def.name.replace(/^🏁 |^🌲 /, '') : '';
     const modeName = {
       race: '🏁 竞速赛 3圈', time: '⏱ 计时赛 1圈', collect: '💠 收集挑战',
       drag: '🚀 直线加速赛', free: '🌊 自由漫游',
+      sprint: `🏁 冲刺赛 · ${defName}`,
+      offroad: `🌲 越野赛 · ${defName}`,
     };
     $('mode-val').textContent = modeName[mode];
-    const best = localStorage.getItem(`rg_best_${mode}`);
+    // 赛事纪录键：环道四模式用 mode 名，冲刺/越野用事件 key（同模式多路线）
+    this._activeKey = this._activeKey || mode;
+    if (!sprintLike) this._activeKey = mode;
+    const best = this.getBest(this._activeKey);
     $('best-line').style.display = best ? 'block' : 'none';
     if (best) $('best-val').textContent = fmtTime(parseFloat(best));
     if (mode === 'free') {
@@ -397,7 +591,13 @@ export class Game {
   }
 
   toMenu() {
+    this.save(); // v2.32：回主菜单 = 存档触发点 4
     this.state = 'menu';
+    this._stateBeforePause = null;
+    this._savedPos = this.mode === 'free' && this.slotId >= 0
+      ? { x: this.player.pos.x, z: this.player.pos.z, yaw: this.player.yaw }
+      : this._savedPos; // 记住漫游位置供存档兜底（比赛中不动）
+    $('pauseMenu').style.display = 'none'; // 暂停菜单兜底隐藏
     $('menu').style.display = 'flex';
     $('result').style.display = 'none';
     $('hud').style.display = 'none';
@@ -411,11 +611,18 @@ export class Game {
   }
 
   togglePause() {
+    if ($('bigMap').style.display !== 'none') return; // 大地图打开时忽略 Esc 暂停（已暂停中）
     if (this.state === 'running' || this.state === 'countdown') {
+      this._stateBeforePause = this.state; // 保存暂停前状态（倒计时中暂停 → 回到倒计时）
       this.state = 'paused';
-      this.toast('⏸ 已暂停（点按钮继续）', 999999);
+      this.toast('⏸ 已暂停', 1500);
+      $('pauseMenu').style.display = 'flex'; // v2.19.2：暂停菜单（回到游戏 / 返回主界面）
+      this.audio.setSpeed(0, false);
     } else if (this.state === 'paused') {
-      this.state = 'running';
+      // 恢复暂停前的状态（倒计时中暂停 → 回到倒计时，不跳秒）
+      $('pauseMenu').style.display = 'none';
+      this.state = this._stateBeforePause || 'running';
+      this._stateBeforePause = null;
       $('toast').style.display = 'none';
     }
   }
@@ -426,6 +633,243 @@ export class Game {
     t.style.display = 'block';
     clearTimeout(this._tt);
     if (dur < 99999) this._tt = setTimeout(() => { t.style.display = 'none'; }, dur);
+  }
+
+  // ---- 导航（v2.18）：长按小地图开大地图 → 点选目的地 → A* 路网寻路 → 流光线 + HUD 距离 ----
+  buildBigMap() {
+    const S = 1024;
+    this.bmSize = S;
+    // 底图：全路网静态渲染一次（画进离屏 canvas，动态层每帧只 drawImage + 少量点）
+    this.bmBase = document.createElement('canvas');
+    this.bmBase.width = S; this.bmBase.height = S;
+    const x = this.bmBase.getContext('2d');
+    // 边界（与 buildMinimapBase 同源数据：track + minimapPolylines）
+    let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
+    const grow = (wx, wz) => {
+      minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
+      minZ = Math.min(minZ, wz); maxZ = Math.max(maxZ, wz);
+    };
+    for (const s of this.track.samples) grow(s.pos.x, s.pos.z);
+    for (const poly of this.world.minimapPolylines) for (const [wx, wz] of poly) grow(wx, wz);
+    const pad = 24;
+    const sc = Math.min((S - pad * 2) / (maxX - minX), (S - pad * 2) / (maxZ - minZ));
+    this.bmFn = (wx, wz) => [pad + (wx - minX) * sc, S - pad - (wz - minZ) * sc];
+    // 反算（大地图点选 → 世界坐标）
+    this.bmInv = (mx, my) => [(mx - pad) / sc + minX, (S - pad - my) / sc + minZ];
+    // 背景
+    x.fillStyle = 'rgba(6, 11, 22, 0.96)';
+    x.fillRect(0, 0, S, S);
+    const line = (pts, style, w) => {
+      x.strokeStyle = style; x.lineWidth = w; x.beginPath();
+      pts.forEach(([wx, wz], i) => {
+        const [a, b] = this.bmFn(wx, wz);
+        i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
+      });
+      x.closePath(); x.stroke();
+    };
+    const polys = this.world.minimapPolylines;
+    line(polys[0], 'rgba(176,182,192,0.95)', 9);  // 高速
+    line(polys[1], 'rgba(150,157,168,0.95)', 6);  // 城市环线
+    line(polys[2], 'rgba(176,182,192,0.95)', 6);  // 乡道
+    for (let i = 3; i < polys.length; i++) line(polys[i], 'rgba(132,140,152,0.9)', 4); // 街道与其余路
+    x.strokeStyle = 'rgba(150,157,168,0.95)'; x.lineWidth = 7;
+    x.beginPath();
+    this.track.samples.forEach((sm, i) => {
+      const [a, b] = this.bmFn(sm.pos.x, sm.pos.z);
+      i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
+    });
+    x.closePath(); x.stroke();
+    // 起点标记
+    const [sx, sy] = this.bmFn(this.track.startPos.x, this.track.startPos.z);
+    x.fillStyle = '#ffdd44';
+    x.beginPath(); x.arc(sx, sy, 6, 0, Math.PI * 2); x.fill();
+  }
+
+  openBigMap() {
+    // v2.19.1：打开地图即暂停游戏（关图恢复原状态；导航 tick/物理/车流全部冻结）
+    if (this.state === 'running' || this.state === 'countdown') {
+      this._stateBeforeMap = this.state;
+      this.state = 'paused';
+    }
+    $('bigMap').style.display = 'flex';
+    this.bigPick = null;                 // 本次打开的待确认点
+    $('btn-nav-go').disabled = true;
+    $('bm-hint').textContent = '点选地图任意位置作为目的地';
+    $('btn-nav-cancel-route').style.display = this.nav ? 'inline-block' : 'none';
+    this.audio.setSpeed(0, false); // 引擎音随暂停熄火
+    this.audio.beep(520, 0.1, 0.15);
+  }
+
+  closeBigMap() {
+    $('bigMap').style.display = 'none';
+    // 恢复打开前的状态（用户本就暂停 → 恢复暂停）
+    if (this._stateBeforeMap && this.state === 'paused') {
+      this.state = this._stateBeforeMap;
+      this._stateBeforeMap = null;
+      if (this.state === 'running') this.audio.setSpeed(this.player.speed, true, this.player.throttleSm);
+    }
+  }
+
+  // 大地图点选：放置/移动标记；靠近活动光柱自动识别名称
+  pickBigMap(ev) {
+    const cv = $('bigMapCanvas');
+    const r = cv.getBoundingClientRect();
+    const mx = (ev.clientX - r.left) * (this.bmSize / r.width);
+    const my = (ev.clientY - r.top) * (this.bmSize / r.height);
+    const [wx, wz] = this.bmInv(mx, my);
+    this.bigPick = { x: wx, z: wz, name: '自定义目的地' };
+    for (const e of this.events) {
+      if (Math.hypot(e.pos.x - wx, e.pos.z - wz) < 60) {
+        this.bigPick = { x: e.pos.x, z: e.pos.z, name: e.name };
+        break;
+      }
+    }
+    $('btn-nav-go').disabled = false;
+    $('bm-hint').textContent = `目的地：${this.bigPick.name}（点${'「'}开始导航${'」'}确认）`;
+    this.audio.beep(700, 0.08, 0.12);
+  }
+
+  // 大地图动态层（drawMinimap 每帧连带调用：地图打开时车/AI 仍在动）
+  drawBigMap() {
+    if ($('bigMap').style.display === 'none') return;
+    const cv = $('bigMapCanvas');
+    const x = cv.getContext('2d');
+    const S = this.bmSize;
+    x.clearRect(0, 0, S, S);
+    x.drawImage(this.bmBase, 0, 0);
+    // 导航路线
+    if (this.nav) {
+      x.strokeStyle = 'rgba(46,230,255,0.95)';
+      x.lineWidth = 4;
+      x.beginPath();
+      this.nav.pts.forEach((p, i) => {
+        const [a, b] = this.bmFn(p.x, p.z);
+        i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
+      });
+      x.stroke();
+      // 导航目的地脉冲
+      const [dx, dy] = this.bmFn(this.nav.dest.x, this.nav.dest.z);
+      const pr = 9 + Math.sin(performance.now() / 180) * 3;
+      x.fillStyle = 'rgba(46,230,255,0.5)';
+      x.beginPath(); x.arc(dx, dy, pr + 5, 0, Math.PI * 2); x.fill();
+      x.fillStyle = '#2ee6ff';
+      x.beginPath(); x.arc(dx, dy, 7, 0, Math.PI * 2); x.fill();
+    }
+    // 活动光柱点
+    for (const e of this.events) {
+      const [a, b] = this.bmFn(e.pos.x, e.pos.z);
+      x.fillStyle = `#${e.color.toString(16).padStart(6, '0')}`;
+      x.beginPath(); x.arc(a, b, 6, 0, Math.PI * 2); x.fill();
+      x.lineWidth = 2; x.strokeStyle = 'rgba(255,255,255,0.8)'; x.stroke();
+    }
+    // 待确认标记
+    if (this.bigPick) {
+      const [a, b] = this.bmFn(this.bigPick.x, this.bigPick.z);
+      x.strokeStyle = '#ff4d6a'; x.lineWidth = 3;
+      x.beginPath(); x.arc(a, b, 12, 0, Math.PI * 2); x.stroke();
+      x.beginPath(); x.arc(a, b, 4, 0, Math.PI * 2); x.fillStyle = '#ff4d6a'; x.fill();
+    }
+    // 玩家箭头
+    const [px2, py2] = this.bmFn(this.player.pos.x, this.player.pos.z);
+    x.save();
+    x.translate(px2, py2);
+    x.rotate(-this.player.yaw); // 地图北朝上：yaw 逆时针为正 → 屏幕顺时针取负
+    x.fillStyle = '#ff3344';
+    x.strokeStyle = '#ffffff'; x.lineWidth = 2;
+    x.beginPath();
+    x.moveTo(0, -13); x.lineTo(8, 9); x.lineTo(0, 4); x.lineTo(-8, 9);
+    x.closePath(); x.fill(); x.stroke();
+    x.restore();
+    // 北向 N
+    x.fillStyle = '#fff'; x.font = 'bold 22px sans-serif'; x.textAlign = 'center';
+    x.fillText('N', S - 34, 34);
+  }
+
+  setNavDest(pos, name) {
+    this.closeBigMap();
+    this.computeRoute(pos, name);
+    if (!this.nav) return;
+    this.toast(`🧭 导航：${name}`, 2200);
+    $('nav-box').style.display = 'block';
+    this.audio.beep(760, 0.12, 0.2);
+  }
+
+  computeRoute(pos, name) {
+    const res = findRoute(this.navGraph, this.player.pos.x, this.player.pos.z, pos.x, pos.z);
+    const full = [new THREE.Vector3(this.player.pos.x, 0, this.player.pos.z)];
+    let fallback = false, hops = 0;
+    if (res) {
+      for (const p of res.pts) full.push(new THREE.Vector3(p.x, p.y, p.z));
+      hops = res.hops || 0;
+    } else {
+      // 目的地离任何路网节点都太远（>40m，如空地/野地深处）：直线引导兜底
+      full.push(new THREE.Vector3(pos.x, 0, pos.z));
+      fallback = true;
+    }
+    full.push(new THREE.Vector3(pos.x, pos.y || 0, pos.z));
+    // 累计里程表（剩余距离用）
+    const cum = [0];
+    for (let i = 1; i < full.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(full[i].x - full[i - 1].x, full[i].z - full[i - 1].z));
+    }
+    this.nav = { name, dest: new THREE.Vector3(pos.x, pos.y || 0, pos.z), pts: full, cum, cursor: 0, rerouteT: 0, fallback, hops };
+    this.navGuide.setRoute(full);
+  }
+
+  clearNav() {
+    this.nav = null;
+    this.navGuide.clear();
+    $('nav-box').style.display = 'none';
+  }
+
+  navTick(dt) {
+    const nv = this.nav;
+    if (!nv) return;
+    const box = $('nav-box');
+    if (this.mode !== 'free' || this.state !== 'running') {
+      this.navGuide.group.visible = false;
+      box.style.display = 'none';
+      return;
+    }
+    this.navGuide.group.visible = true;
+    this.navGuide.update(dt);
+    box.style.display = 'block';
+
+    const p = this.player.pos;
+    // 最近路径段（游标窗口搜索防高速跳变）
+    let best = Infinity, bi = nv.cursor, bt = 0;
+    const lo = Math.max(0, nv.cursor - 40), hi = Math.min(nv.pts.length - 1, nv.cursor + 40);
+    for (let k = lo; k < hi; k++) {
+      const a = nv.pts[k], b = nv.pts[k + 1];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const l2 = dx * dx + dz * dz || 1;
+      let t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / l2;
+      t = Math.max(0, Math.min(1, t));
+      const d = Math.hypot(p.x - (a.x + dx * t), p.z - (a.z + dz * t));
+      if (d < best) { best = d; bi = k; bt = t; }
+    }
+    nv.cursor = bi;
+    // 偏航 >45m 持续 1.2s → 就近重算；路网不通则保持直线兜底
+    if (best > 45) {
+      nv.rerouteT += dt;
+      if (nv.rerouteT > 1.2) {
+        nv.rerouteT = 0;
+        const old = nv;
+        this.computeRoute(nv.dest, nv.name);
+        if (this.nav && !this.nav.fallback) this.toast('🧭 已重新规划路线', 1600);
+        else if (!this.nav) this.nav = old;
+      }
+    } else nv.rerouteT = 0;
+    // 剩余距离 = 全程 − 已走（游标段投影进度）+ 到路径的横向残差
+    const segLen = nv.cum[bi + 1] - nv.cum[bi];
+    const remain = nv.cum[nv.cum.length - 1] - (nv.cum[bi] + segLen * bt) + best;
+    $('nav-val').textContent = `${Math.max(0, Math.round(remain))} m${nv.fallback ? ' ·直线' : (nv.hops ? ' ·含越野' : '')}`;
+    // 到达判定
+    if (Math.hypot(p.x - nv.dest.x, p.z - nv.dest.z) < 20) {
+      const name = nv.name;
+      this.clearNav();
+      this.toast(`🧭 已到达：${name}`, 2500);
+    }
   }
 
   // ---- 活动报名 / 返回漫游 ----
@@ -448,12 +892,56 @@ export class Game {
     this.setPromptEvent(null);
   }
 
+  // ---- v2.32 存档 / 积分 / 车库 ----
+  // 纪录读写：有槽位走槽位表，否则回退全局 rg_best_*（测试直开模式兼容）
+  getBest(key) {
+    if (this.bests) return this.bests[key] || null;
+    const v = parseFloat(localStorage.getItem(`rg_best_${key}`) || '');
+    return v > 0 ? v : null;
+  }
+  setBest(key, t) {
+    if (this.bests) {
+      if (!this.bests[key] || t < this.bests[key]) { this.bests[key] = t; return true; }
+      return false;
+    }
+    const cur = parseFloat(localStorage.getItem(`rg_best_${key}`) || '');
+    if (!cur || t < cur) { localStorage.setItem(`rg_best_${key}`, t.toFixed(1)); return true; }
+    return false;
+  }
+  owns(id) { return this.owned.includes(id); }
+  buy(spec) {
+    if (this.owns(spec.id) || this.credits < spec.price) return false;
+    this.credits -= spec.price;
+    this.owned.push(spec.id);
+    this.save();
+    return true;
+  }
+  // main.js 读档后注入：槽位数据 → 游戏状态
+  attachSave(slotId, data, saveMgr) {
+    this.slotId = slotId;
+    this.saveMgr = saveMgr || this.saveMgr;
+    this.carId = data.car;
+    this.owned = data.owned.slice();
+    this.credits = data.credits;
+    this.odoTotal = data.odoTotal;
+    this.odoCarry = data.odoCarry;
+    this.bests = { ...data.bests };
+    this.raceLog = { ...data.raceLog };
+    this.playMs = data.playMs;
+    this._sessionStart = Date.now();
+    this._savedPos = data.pos;
+  }
+  // 写档（槽位未挂时静默跳过——测试直开模式）
+  save() {
+    if (this.slotId >= 0 && this.saveMgr) this.saveMgr.writeFromGame(this);
+  }
+
   acceptEvent() {
     if (!this.promptEvent) return;
     const ev = this.promptEvent;
     this.returnPos = this.player.pos.clone(); // 完赛后送回报名点
     this.setPromptEvent(null);
-    this.startMode(ev.mode);
+    this.startMode(ev.mode, ev);
     this.toast(`已报名：${ev.name}`, 2000);
   }
 
@@ -473,28 +961,41 @@ export class Game {
     this.state = 'finished';
     this.audio.setSpeed(0, false);
     let title = '🏁 完成！', line = '';
+    const sprintLike = this.mode === 'sprint' || this.mode === 'offroad';
+    const key = this._activeKey;
+    // 名次：环道按里程；冲刺/越野按冲线时间（完赛早于我方者排前面）
+    let rank = 0;
     if (this.mode === 'race') {
-      const rank = 1 + this.ais.filter((a) => a.total > this.player.total).length;
+      rank = 1 + this.ais.filter((a) => a.total > this.player.total).length;
+    } else if (sprintLike) {
+      rank = 1 + this.ais.filter((a) => a.finishTime != null && a.finishTime <= this.elapsed).length;
+    }
+    if (this.mode === 'race' || sprintLike) {
       title = rank === 1 ? '🏆 冠军！' : `第 ${rank} 名`;
       line = `用时 ${fmtTime(this.elapsed)}`;
     } else if (this.mode === 'drag') {
       title = '🚀 冲线！';
       line = `用时 ${fmtTime(this.elapsed)} · 尾速 ${Math.round(this.topSpeed * 3.6)} km/h`;
-      const key = 'rg_best_drag';
-      const best = parseFloat(localStorage.getItem(key) || '0');
-      if (!best || this.elapsed < best) {
-        localStorage.setItem(key, this.elapsed.toFixed(1));
-        line += `（新纪录！）`;
+    }
+    // 纪录（槽位表优先，测试无档时回退全局键）
+    const isRecord = this.setBest(key, this.elapsed);
+    if (this.mode === 'drag') {
+      if (isRecord) line += `（新纪录！）`;
+    } else if (this.mode !== 'race' && this.mode !== 'free') {
+      const best = this.getBest(key);
+      if (isRecord) line += ` · 新纪录 ${fmtTime(this.elapsed)}！`;
+      else if (this.mode !== 'collect') line += ` · 纪录 ${fmtTime(best)}`;
+    }
+    // ---- 积分结算（v2.32）：名次奖 + 破纪录翻倍 + 首胜加成，写入槽位 ----
+    let reward = 0;
+    if (this.slotId >= 0 && key) {
+      reward = eventReward(key, rank, isRecord, this.raceLog);
+      if (reward > 0) {
+        this.credits += reward;
+        markRaceResult(key, rank, this.raceLog);
+        line += `\n💎 +${reward} 积分（余额 ${this.credits}）`;
       }
-    } else {
-      const key = `rg_best_${this.mode}`;
-      const best = parseFloat(localStorage.getItem(key) || '0');
-      if (!best || this.elapsed < best) {
-        localStorage.setItem(key, this.elapsed.toFixed(1));
-        line = `新纪录 ${fmtTime(this.elapsed)}！（原纪录 ${best ? fmtTime(best) : '无'}）`;
-      } else {
-        line = `用时 ${fmtTime(this.elapsed)}（纪录 ${fmtTime(best)}）`;
-      }
+      this.save(); // 比赛结算 = 存档触发点 1
     }
     $('res-title').textContent = title;
     $('res-line').textContent = line;
@@ -529,11 +1030,58 @@ export class Game {
     // 玩家物理（含桥面高度平滑过渡）
     const groundY = this.world ? this.world.heightAt(this.player.pos) : 0;
     const res = this.player.update(dt, input, this.track, groundY);
+
+    // 落水处理（v2.12）：水面下强减速熄火，1.8s 后拖车拽回最近路面点
+    {
+      // v2.23.2 落水判定加"在路上豁免"：湖东野径贴岸段地形 -1.16（水面 -1.5 之上），
+      // 车贴地形走到 -1.0 以下被误判落水 → 拖回 → 再上路 → 死循环（用户报"过不去"）。
+      // 设计红线本就规定路永不沉水：offroad=false（在公路/野径/桥上）时低高度全是
+      // 采样假阳性（贴岸坡带/桥下河床），只有真冲出路面才判落水。
+      const inWater = this.player.pos.y < -1.0 && this.player.offroad;
+      if (inWater) {
+        const p = this.player;
+        p.speed *= Math.max(0, 1 - 2.8 * dt); // 水阻：几秒内熄火
+        p.pos.y += (groundY - p.pos.y) * Math.min(1, dt * 15); // 快速下沉（别再滑行）
+        if (!this._wasInWater) { // 入水瞬间：水花 + 闷响
+          for (let k = 0; k < 12; k++) {
+            this.smoke.emit(
+              p.pos.x + (Math.random() - 0.5) * 3,
+              -0.9,
+              p.pos.z + (Math.random() - 0.5) * 3
+            );
+          }
+          this.audio.crash(0.5);
+        }
+        this.waterT = (this.waterT || 0) + dt;
+        if (this.waterT > 1.8) {
+          if (this.lastRoadPos) {
+            p.pos.copy(this.lastRoadPos);
+            p.pos.y = this.world ? this.world.heightAt(p.pos) : 0;
+          }
+          p.speed = 0;
+          p.hint = -1;
+          this.toast('💦 落水！拖车已把你拽回路面', 2800);
+          this.audio.beep(220, 0.3, 0.15);
+          this.waterT = 0;
+        }
+      } else {
+        this.waterT = 0;
+        // 记录最近的安全路面点（世界路网或主赛道上都算，随时可回）
+        if (this.player.pos.y > -0.5) {
+          const p = this.player.pos;
+          if ((this.world && this.world.onAnyRoad(p)) || !this.track.isOffroad(p, -1).off) {
+            this.lastRoadPos = p.clone();
+          }
+        }
+      }
+      this._wasInWater = inWater;
+    }
     if (res.dust || res.drifting) {
       const back = this.player.pos.clone();
       back.x -= Math.sin(this.player.yaw) * 1.6;
       back.z -= Math.cos(this.player.yaw) * 1.6;
-      this.dust.emit(back.x, 0.3, back.z, res.drifting ? 3 : 1);
+      back.y += 0.3; // 跟随车底（山地/桥面不射进地里）
+      this.dust.emit(back.x, back.y, back.z, res.drifting ? 3 : 1);
     }
     // 漂移/重刹：后轮落胎痕 + 冒白烟
     if (res.skid) {
@@ -542,7 +1090,7 @@ export class Game {
       for (const lx of [-0.92, 0.92]) {
         const wx = p.pos.x + lx * cy - 1.35 * sy;
         const wz = p.pos.z - lx * sy - 1.35 * cy;
-        this.skids.add(wx, wz, p.yaw);
+        this.skids.add(wx, wz, p.yaw, p.pos.y); // 山地/桥面胎痕跟随车底高度
         if (res.drifting) this.smoke.emit(wx, 0.4, wz);
       }
     }
@@ -576,6 +1124,26 @@ export class Game {
     // 撞击震屏衰减
     this.crashShake = Math.max(0, this.crashShake - dt * 1.6);
 
+    // ---- v2.32 里程积分（每 1km=1 分，全模式）+ 自由漫游定时存档 ----
+    {
+      const v = Math.abs(this.player.speed);
+      if (v >= ODO_MIN_SPEED) {
+        const step = Math.min(v * dt, ODO_FRAME_CAP); // 单帧钳位防大 dt 刷分
+        this.odoCarry += step;
+        this.odoTotal += step;
+        let gained = 0;
+        while (this.odoCarry >= ODO_STEP) { this.odoCarry -= ODO_STEP; gained++; }
+        if (gained > 0) {
+          this.credits += gained;
+          if (this.mode === 'free') this.toast(`💎 里程积分 +${gained}`, 1200); // 比赛中安静攒，结算一起给
+        }
+      }
+      if (this.mode === 'free' && this.state === 'running') {
+        this._autosaveT += dt;
+        if (this._autosaveT >= 60) { this._autosaveT = 0; this.save(); } // 存档触发点 3
+      }
+    }
+
     // NPC 车流：红绿灯停车 + 巡航（红绿灯周期由 world.update 驱动）
     this.world.update(dt);
     for (const t of this.traffic) {
@@ -588,6 +1156,13 @@ export class Game {
         }
       }
       t.updateTraffic(dt, t.route, hold);
+    }
+
+    // 自由漫游：环道环境车流（竞速 AI 转岗，固定车速巡航，无橡皮筋）
+    if (this.mode === 'free') {
+      for (const ai of this.ais) {
+        if (ai.group.visible) ai.updateTraffic(dt, this.track);
+      }
     }
 
     // 检查点 / 圈数
@@ -636,6 +1211,50 @@ export class Game {
       }
     }
 
+    // ---- 冲刺/越野赛（v2.32）：玩家进度投影 + 检查点 + AI + 冲线 ----
+    if (this.mode === 'sprint' || this.mode === 'offroad') {
+      const sp = this.sprint, R = sp.R;
+      // 玩家沿路线的曲线里程：窗口最近段投影（游标 ±40 段防高速跳变，同 navTick 法）。
+      // samples 由 getPointAt 均匀参数生成 → 弧长均匀，索引 i ≈ 里程 i·per
+      const p = this.player.pos;
+      let best = Infinity, bi = sp.cursor, bt = 0;
+      const lo = Math.max(0, sp.cursor - 40), hi = Math.min(R.samples.length - 1, sp.cursor + 40);
+      for (let k = lo; k < hi; k++) {
+        const a = R.samples[k].pos, b = R.samples[k + 1].pos;
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const l2 = dx * dx + dz * dz || 1;
+        let t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / l2;
+        t = Math.max(0, Math.min(1, t));
+        const d = Math.hypot(p.x - (a.x + dx * t), p.z - (a.z + dz * t));
+        if (d < best) { best = d; bi = k; bt = t; }
+      }
+      sp.cursor = bi;
+      const per = R.length / (R.samples.length - 1);
+      sp.playerTotal = Math.min(R.length, (bi + bt) * per);
+      // 检查点按序通过（进度单调 → 倒车回去再前进不会重复计数）
+      while (sp.nextCp < sp.cps.length && sp.playerTotal >= sp.cps[sp.nextCp]) {
+        sp.nextCp++;
+        this.audio.beep(700 + sp.nextCp * 40, 0.12, 0.2);
+        $('collect-val').textContent = `${sp.nextCp} / ${sp.cps.length}`;
+        if (sp.nextCp < sp.cps.length) this.toast(`检查点 ${sp.nextCp} / ${sp.cps.length}`, 900);
+        else this.toast('冲线！', 900);
+      }
+      // AI 冲线计时 + 实时名次
+      this.ais.forEach((ai) => {
+        ai.updateSprint(dt, R, sp.playerTotal);
+        if (ai.finished && ai.finishTime == null) ai.finishTime = this.elapsed;
+      });
+      const rk = 1 + this.ais.filter((a) =>
+        (a.finishTime != null && a.finishTime <= this.elapsed) ||
+        (a.finishTime == null && a.total > sp.playerTotal)).length;
+      $('rank-val').textContent = `${rk} / ${this.ais.length + 1}`;
+      // 冲线：全门通过（终点门即最后一门，位于路线 99.3% 处）
+      if (sp.nextCp >= sp.cps.length) {
+        this.finish();
+        return Math.max(0, this.crashShake);
+      }
+    }
+
     // 自由漫游：靠近活动光柱弹报名面板；光环常转
     if (this.mode === 'free') {
       let near = null;
@@ -651,7 +1270,10 @@ export class Game {
     }
 
     // HUD
-    $('speed-val').textContent = Math.round(Math.abs(this.player.speed) * 3.6);
+    const kmh = Math.round(Math.abs(this.player.speed) * 3.6);
+    $('speed-val').textContent = kmh;
+    const sf = $('speed-fill');
+    if (sf) sf.style.width = Math.min(100, (kmh / 180) * 100) + '%'; // 速度条 0~180km/h
     $('time-val').textContent = fmtTime(this.elapsed);
     if (this.mode === 'race' || this.mode === 'time')
       $('lap-val').textContent = `${Math.min(this.lap, this.mode === 'race' ? LAPS_RACE : 1)} / ${this.mode === 'race' ? LAPS_RACE : 1}`;
@@ -661,10 +1283,12 @@ export class Game {
     }
     if (this.mode === 'collect')
       $('collect-val').textContent = `${this.collected} / ${this.rings.length}`;
+    $('credit-val').textContent = this.credits; // v2.32 积分常显
+    this.navTick(dt); // 导航：进度/偏航重算/到达判定（v2.18）
     this.drawMinimap();
 
-    // 引擎音
-    this.audio.setSpeed(this.player.speed, true);
+    // 引擎音（v2.26：油门双变量调制——地板油透亮、松油回闷）
+    this.audio.setSpeed(this.player.speed, true, this.player.throttleSm);
 
     // 相机抖动（高速 + 碰撞）
     return Math.max(
@@ -677,15 +1301,36 @@ export class Game {
   bindUI() {
     // 模式入口：主菜单只有"开始自驾"（free）；其余模式经地图光柱活动面板进入，
     // 直接调用 startMode 仍可用于测试
-    $('btn-restart').onclick = () => this.startMode(this.mode);
+    // 冲刺/越野赛重启要带回原路线（同 mode 多路线，缺省 find 只会拿第一条）
+    $('btn-restart').onclick = () => this.startMode(this.mode, this.sprint ? this.sprint.def : null);
     $('btn-menu2').onclick = () => this.toMenu();
     $('btn-pause').onclick = () => this.togglePause();
     $('btn-join').onclick = () => this.acceptEvent();
     $('btn-dismiss').onclick = () => this.dismissPrompt();
     $('btn-roam').onclick = () => this.returnToFree();
+    // 暂停菜单（v2.19.2）
+    $('btn-resume').onclick = () => this.togglePause();
+    $('btn-pause-menu').onclick = () => this.toMenu();
+    // 大地图导航（v2.18）
+    $('bigMapCanvas').addEventListener('pointerdown', (e) => this.pickBigMap(e));
+    $('btn-nav-go').onclick = () => {
+      if (!this.bigPick) return;
+      this.setNavDest(
+        new THREE.Vector3(this.bigPick.x, 0, this.bigPick.z),
+        this.bigPick.name
+      );
+      this.closeBigMap();
+    };
+    $('btn-bigmap-close').onclick = () => this.closeBigMap();
+    $('btn-nav-cancel-route').onclick = () => {
+      this.clearNav();
+      this.closeBigMap();
+      this.toast('🧭 已取消导航', 1600);
+    };
     // 键盘 E 快捷报名
     window.addEventListener('keydown', (e) => {
       if (e.key.toLowerCase() === 'e' && this.promptEvent) this.acceptEvent();
     });
   }
 }
+

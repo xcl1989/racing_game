@@ -1,0 +1,35 @@
+# ==== 依赖与缓存 ====
+node_modules/
+__pycache__/
+*.pyc
+
+# ==== 大体积 / 可再生内容 ====
+# 测试截图（可随时用 tests 脚本重新生成）
+shots/
+# 源模归档 ~215MB（运行时只加载 models/ 根下的模型）
+models/src/
+# 服务器日志
+server.log
+*.log
+
+# ==== 本地证书（自签 HTTPS，私钥绝不入库，可重新生成） ====
+key.pem
+cert.pem
+
+# ==== Agent 工作区 / 系统杂项 ====
+.crabagent/
+.DS_Store
+Thumbs.db
+desktop.ini
+tmp_*
+
+# ==== 开发专用（只发布游戏本体：代码 + 模型 + README + 截图） ====
+AGENTS.md
+docs/*.md
+tests/
+tools/
+legacy/
+
+# ==== 未被运行时引用的中间版本（可由 models/src 源模重新生成，保留在本地磁盘） ====
+models/xiaomi_yu7_opt.glb
+models/xiaomi_su7_ultra_opt.glb
