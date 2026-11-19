@@ -5,6 +5,7 @@ import {
   makeGrassTexture, makeWaterNormal, makeTuftTexture,
   makeBillboardTexture, makeBirdTexture, makeFieldTexture,
 } from './textures.js';
+import { firCrown } from './scene-detail.js';
 import { HALF_WIDTH } from './track.js';
 import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
 import { makeFoliageTexture } from './textures.js';           // v2.25 叶丛斑驳贴图
@@ -151,19 +152,33 @@ export function buildScenery(scene, track, world, rich = true) {
     for (const [cx, cz, rot] of [[868, -368, 0.5], [888, -452, -0.9], [852, -478, 2.2]]) {
       const house = new THREE.Group();
       const body = new THREE.Mesh(new THREE.BoxGeometry(9, 4.2, 7), wallMat);
+      const stone = new THREE.Mesh(new THREE.BoxGeometry(9.12,0.55,7.12), new THREE.MeshStandardMaterial({color:0x81776a,roughness:.93}));
+      stone.position.y = .28;
+      house.add(stone);
       body.position.y = 2.1;
       body.castShadow = true;
       house.add(body);
-      const roof = new THREE.Mesh(new THREE.ConeGeometry(6.4, 3, 4), roofMat);
-      roof.position.y = 5.6;
-      roof.rotation.y = Math.PI / 4;
+      // Extruded gable and two sloping eaves, not a pyramid perched on a box.
+      const gable = new THREE.Shape();
+      gable.moveTo(-4.85,4.14); gable.lineTo(4.85,4.14); gable.lineTo(0,6.65); gable.closePath();
+      const roof = new THREE.Mesh(new THREE.ExtrudeGeometry(gable,{depth:7.7,bevelEnabled:false}),roofMat);
+      roof.position.z = -3.85;
       roof.castShadow = true;
       house.add(roof);
-      for (const wx of [-2.6, 2.6]) {
-        const win = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.4, 0.15), glassMat);
-        win.position.set(wx, 2.2, 3.55);
-        house.add(win);
+      const frameMat = new THREE.MeshStandardMaterial({color:0xb9b2a3,roughness:.82});
+      const doorMat = new THREE.MeshStandardMaterial({color:0x453e35,roughness:.93});
+      for (const side of [-1,1]) for (const wx of [-2.65,2.65]) {
+        const frame = new THREE.Mesh(new THREE.BoxGeometry(1.58,1.42,.16),frameMat);
+        frame.position.set(wx,2.30,side*3.53);
+        const win = new THREE.Mesh(new THREE.BoxGeometry(1.30,1.14,.07),glassMat);
+        win.position.set(wx,2.30,side*3.64);
+        house.add(frame,win);
       }
+      const door = new THREE.Mesh(new THREE.BoxGeometry(1.20,2.16,.16),doorMat);
+      const chimney = new THREE.Mesh(new THREE.BoxGeometry(.65,2.0,.74),wallMat);
+      door.position.set(0,1.17,3.57);
+      chimney.position.set(2.0,5.88,-1.45);
+      house.add(door,chimney);
       house.position.set(cx, 0, cz);
       house.rotation.y = rot;
       scene.add(house);
@@ -304,7 +319,7 @@ export function buildScenery(scene, track, world, rich = true) {
       const n = Math.sin(v.x * 3.1 + 1.2) * Math.sin(v.y * 2.7 + 3.4) * Math.sin(v.z * 3.3 + 1.1)
         + 0.5 * Math.sin(v.x * 5.7 + v.z * 4.9)
         + 0.35 * Math.sin(v.y * 7.3 - v.x * 2.1);
-      const m = 1 + 0.17 * n;
+      const m = 1 + 0.30 * n;
       p.setXYZ(i, v.x * m, v.y * m * 0.9, v.z * m);
     }
     g.computeVertexNormals();
@@ -312,16 +327,22 @@ export function buildScenery(scene, track, world, rich = true) {
   }
   const leafGeo = lumpyLeaf();
   const foliageTex = makeFoliageTexture();
-  const trunkGeo = new THREE.CylinderGeometry(0.18, 0.3, 2.6, 7);
+  const trunkGeo = new THREE.CylinderGeometry(0.13, 0.27, 2.6, 7, 3);
+  const barkPos = trunkGeo.attributes.position;
+  for (let i = 0; i < barkPos.count; i++) {
+    const y = barkPos.getY(i);
+    barkPos.setX(i, barkPos.getX(i) + 0.09 * Math.sin((y + 1.3) * 0.9));
+  }
+  trunkGeo.computeVertexNormals();
   const trunkMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 });
   const trunk = new THREE.InstancedMesh(trunkGeo, trunkMat, N_TREE); // v2.13 instanceColor 染干
   const canopy = new THREE.InstancedMesh(leafGeo,
     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_TREE * 4);
   // v2.23 针叶树实例集
   const pineTrunk = new THREE.InstancedMesh(trunkGeo, trunkMat, N_TREE);
-  const coneGeo = new THREE.ConeGeometry(1, 1, 8);
+  const coneGeo = firCrown();
   const conifer = new THREE.InstancedMesh(coneGeo,
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_TREE * 3);
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.97, vertexColors: true }), N_TREE * 3);
   trunk.castShadow = canopy.castShadow = pineTrunk.castShadow = conifer.castShadow = true;
   const pineLayers = [[2.4, 1.7, 1.6], [3.5, 1.3, 1.4], [4.4, 0.85, 1.2]]; // [底y, 半径, 层高]
   // v2.25 每棵树随机冠团布局：1 大顶团 + 3 侧团（随机方位/半径/高度/尺寸）
@@ -331,10 +352,10 @@ export function buildScenery(scene, track, world, rich = true) {
     const sideN = 3;
     for (let b = 0; b < sideN; b++) {
       const a = a0 + (b / sideN) * Math.PI * 2 + (Math.random() - 0.5) * 1.0;
-      const r = 0.55 + Math.random() * 0.4;
+      const r = 0.83 + Math.random() * 0.53;
       blobs.push([
         Math.cos(a) * r,
-        2.7 + Math.random() * 1.0,
+        2.6 + Math.random() * 1.3,
         Math.sin(a) * r,
         0.75 + Math.random() * 0.4,
       ]);
@@ -389,7 +410,7 @@ export function buildScenery(scene, track, world, rich = true) {
       for (let b = 0; b < blobs.length; b++) {
         const [ox, oy, oz, bs] = blobs[b];
         dummy.position.set(x + ox * sc, oy * sc + th, z + oz * sc);
-        dummy.scale.set(bs * sc, bs * sc * 0.85, bs * sc);
+        dummy.scale.set(bs * sc, bs * sc * (0.66 + 0.14 * b), bs * sc);
         dummy.rotation.y = Math.random() * Math.PI;
         dummy.updateMatrix();
         const idx = placed * 4 + b;
@@ -497,11 +518,11 @@ export function buildScenery(scene, track, world, rich = true) {
     const GROVES = [[-350, -650], [-150, -950], [250, 900]];
     const N_PINE = 46;
     const pineTrunkGeo = new THREE.CylinderGeometry(0.28, 0.42, 3.4, 6);
-    const pineConeGeo = new THREE.ConeGeometry(3.2, 13, 8);
+    const pineConeGeo = firCrown().scale(3.2,13,3.2);
     const trunks = new THREE.InstancedMesh(pineTrunkGeo,
       new THREE.MeshStandardMaterial({ color: 0x4a3628, roughness: 1 }), N_PINE * GROVES.length);
     const crowns = new THREE.InstancedMesh(pineConeGeo,
-      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 }), N_PINE * GROVES.length);
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.97, vertexColors: true }), N_PINE * GROVES.length);
     trunks.castShadow = crowns.castShadow = true;
     let pi = 0, pTries = 0;
     for (const [gx, gz] of GROVES) {
@@ -596,8 +617,10 @@ export function buildScenery(scene, track, world, rich = true) {
         const px = st.ax + dx * t, pz = st.az + dz * t;
         const ox = (-dz / len) * (st.width / 2 + 1.5);
         const oz = (dx / len) * (st.width / 2 + 1.5);
-        spots.push(new THREE.Vector3(px + ox, 0, pz + oz));
-        spots.push(new THREE.Vector3(px - ox, 0, pz - oz));
+        for (const side of [-1, 1]) {
+          const x = px + side * ox, z = pz + side * oz;
+          if (!world.isOnCityRoad({ x, z })) spots.push(new THREE.Vector3(x, 0, z));
+        }
       }
     }
     const lamps = new THREE.InstancedMesh(poleGeo, metalMat, spots.length);
@@ -772,7 +795,7 @@ export function buildScenery(scene, track, world, rich = true) {
         const px = st.ax + dx * t, pz = st.az + dz * t;
         const ox = (-dz / len) * (st.width / 2 + 3.2);
         const oz = (dx / len) * (st.width / 2 + 3.2);
-        spots.push([px + ox, pz + oz, px - ox, pz - oz]);
+        spots.push([px + ox, pz + oz], [px - ox, pz - oz]);
       }
     }
     for (const route of [world.lakeRoad, world.northConn, world.westLake]) {
@@ -792,47 +815,45 @@ export function buildScenery(scene, track, world, rich = true) {
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_ST * 3);
     stTrunk.castShadow = stCanopy.castShadow = true;
     let si = 0, sci = 0;
-    for (const spot of spots) {
-      const [x, z, x2, z2] = spot;
-      for (const [px, pz] of (x2 !== undefined ? [[x, z], [x2, z2]] : [[x, z]])) {
-        if (si >= N_ST) break;
-        const th = TH(px, pz);
-        if (th < -0.4) continue; // 湖边不下水
-        const sc = 0.75 + Math.random() * 0.55;
-        dummy.position.set(px, 1.2 * sc + th, pz);
-        dummy.scale.set(sc, sc, sc);
+    for (const [px, pz] of spots) {
+      const th = TH(px, pz);
+      const pos = { x: px, z: pz };
+      if (th < -0.4 || world.onAnyRoad(pos)) continue;
+      if (world.bldColliders.some(({ x, z, hw, hd }) => Math.abs(px - x) < hw + 1.2 && Math.abs(pz - z) < hd + 1.2)) continue;
+      const sc = 0.75 + Math.random() * 0.55;
+      dummy.position.set(px, 1.2 * sc + th, pz);
+      dummy.scale.set(sc, sc, sc);
+      dummy.rotation.y = Math.random() * Math.PI;
+      dummy.updateMatrix();
+      stTrunk.setMatrixAt(si, dummy.matrix);
+      // v2.25 三团冠：顶部大团 + 两侧随机小团（随机方位/尺寸，去"双球棒棒糖"）
+      const stBlobs = [[0, 2.95, 0, 1.2 + Math.random() * 0.2]];
+      const sa0 = Math.random() * Math.PI * 2;
+      for (let b = 0; b < 2; b++) {
+        const sa = sa0 + b * Math.PI + (Math.random() - 0.5) * 1.2;
+        stBlobs.push([
+          Math.cos(sa) * (0.5 + Math.random() * 0.3),
+          2.35 + Math.random() * 0.7,
+          Math.sin(sa) * (0.5 + Math.random() * 0.3),
+          0.65 + Math.random() * 0.3,
+        ]);
+      }
+      for (let b = 0; b < stBlobs.length; b++) {
+        const [ox, oy, oz, bs] = stBlobs[b];
+        dummy.position.set(px + ox * sc, oy * sc + th, pz + oz * sc);
+        dummy.scale.set(bs * sc, bs * sc * (0.66 + 0.14 * b), bs * sc);
         dummy.rotation.y = Math.random() * Math.PI;
         dummy.updateMatrix();
-        stTrunk.setMatrixAt(si, dummy.matrix);
-        // v2.25 三团冠：顶部大团 + 两侧随机小团（随机方位/尺寸，去"双球棒棒糖"）
-        const stBlobs = [[0, 2.95, 0, 1.2 + Math.random() * 0.2]];
-        const sa0 = Math.random() * Math.PI * 2;
-        for (let b = 0; b < 2; b++) {
-          const sa = sa0 + b * Math.PI + (Math.random() - 0.5) * 1.2;
-          stBlobs.push([
-            Math.cos(sa) * (0.5 + Math.random() * 0.3),
-            2.35 + Math.random() * 0.7,
-            Math.sin(sa) * (0.5 + Math.random() * 0.3),
-            0.65 + Math.random() * 0.3,
-          ]);
-        }
-        for (let b = 0; b < stBlobs.length; b++) {
-          const [ox, oy, oz, bs] = stBlobs[b];
-          dummy.position.set(px + ox * sc, oy * sc + th, pz + oz * sc);
-          dummy.scale.set(bs * sc, bs * sc * 0.85, bs * sc);
-          dummy.rotation.y = Math.random() * Math.PI;
-          dummy.updateMatrix();
-          const t = 0.8 + Math.random() * 0.45;
-          tmpColor.setRGB(0.25 * t, 0.5 * t, 0.23 * t);
-          stCanopy.setMatrixAt(sci, dummy.matrix);
-          stCanopy.setColorAt(sci, tmpColor);
-          sci++;
-        }
-        si++;
+        const t = 0.8 + Math.random() * 0.45;
+        tmpColor.setRGB(0.25 * t, 0.5 * t, 0.23 * t);
+        stCanopy.setMatrixAt(sci, dummy.matrix);
+        stCanopy.setColorAt(sci, tmpColor);
+        sci++;
       }
+      si++;
     }
     stTrunk.count = si; stCanopy.count = sci;
-    stCanopy.instanceColor.needsUpdate = true;
+    if (stCanopy.instanceColor) stCanopy.instanceColor.needsUpdate = true;
     scene.add(stTrunk, stCanopy);
   }
 

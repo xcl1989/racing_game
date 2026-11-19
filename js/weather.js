@@ -5,8 +5,9 @@
 //   3. 雾颜色与浓度（fogNear/fogFar）
 //   4. 渲染曝光 toneMappingExposure + 云层透明度/染色 + 太阳 sprite 淡出
 //   5. 雨粒子强度 + 雨声 + 路面湿滑系数（wet，main.js 转交给 player）
-// 过渡用 smoothstep 缓动，重绘/重烘按 0.25s 节流（只在过渡期间发生）
+// 过渡用 smoothstep 缓动，重绘/重烘按 0.5s 节流（只在过渡期间发生）
 import * as THREE from 'three';
+import { SUN_U, SUN_V } from './environment.js';
 
 const lerp = (a, b, t) => a + (b - a) * t;
 const smooth = (t) => t * t * (3 - 2 * t);
@@ -19,8 +20,8 @@ export const WEATHER_TYPES = {
     sky: { zenith: '#1d4da8', mid: '#3f86cc', horizon: '#e2edf4', g1: '#9db3a4', g2: '#54685a', g3: '#3a4a40', sunGlow: 0.7 },
     // v2.13 Forza 级晴天观感：黄金时刻更亮更饱（太阳/曝光/半球同步抬）
     // v2.22：太阳再暖再强一档 + 环境对比加深（阴影更有戏，直射面更金）
-    sunI: 2.15, sunColor: 0xffdca0, hemiI: 0.58, hemiSky: 0xbfd9ff, hemiGnd: 0x556a40,
-    fogColor: 0xd7e9f5, fogNear: 340, fogFar: 2700, exp: 1.07,
+    sunI: 1.95, sunColor: 0xffe7c7, hemiI: 0.48, hemiSky: 0xbfd9ff, hemiGnd: 0x556a40,
+    fogColor: 0xd7e9f5, fogNear: 340, fogFar: 2700, exp: 1.04,
     cloudMul: 1.0, cloudTint: 0xffffff, sunSprite: 1.0,
     rain: 0, wet: 0,
   },
@@ -44,7 +45,7 @@ export const WEATHER_TYPES = {
     label: '雨',
     sky: { zenith: '#39424c', mid: '#55606a', horizon: '#828b93', g1: '#666c66', g2: '#3c423e', g3: '#2e3431', sunGlow: 0 },
     sunI: 0.35, sunColor: 0xb8c2cc, hemiI: 0.85, hemiSky: 0x9aa6b2, hemiGnd: 0x424a44,
-    fogColor: 0x7f8890, fogNear: 130, fogFar: 850, exp: 0.76,
+    fogColor: 0x7f8890, fogNear: 130, fogFar: 850, exp: 0.87,
     cloudMul: 2.9, cloudTint: 0xaab0b8, sunSprite: 0,
     rain: 1, wet: 1,
   },
@@ -90,7 +91,7 @@ function blendParams(a, b, t) {
 const hex = (c) => `#${c.getHexString()}`;
 
 export function createWeather({
-  scene, renderer, painter, pmrem, hemi, sun, sunSprite, clouds,
+  scene, painter, bakeEnvironment, hemi, sun, sunSprite, clouds,
   fog, rain, audio, onNotice,
 }) {
   let cur = 'sunny';
@@ -101,9 +102,22 @@ export function createWeather({
   let announced = true;
 
   // 混合起点定格在过渡开始时的 cur（不能把混合结果写回起点，否则指数漂移）
-  let startP = toParams(WEATHER_TYPES.sunny);
+  const presets = Object.fromEntries(Object.entries(WEATHER_TYPES).map(([key, preset]) => [key, toParams(preset)]));
+  let currentP = presets.sunny;
+  let startP = currentP;
+
+  function refreshSky(p) {
+    painter.repaint({
+      zenith: hex(p.zenith), mid: hex(p.mid), horizon: hex(p.horizon),
+      g1: hex(p.g1), g2: hex(p.g2), g3: hex(p.g3),
+      sunX: SUN_U, sunY: 1 - SUN_V, sunGlow: p.sunGlow * 0.36,
+    });
+    scene.environment = bakeEnvironment(p);
+  }
+  refreshSky(startP);
 
   const weather = {
+    exposure: startP.exp,
     wet: 0,                             // 路面湿滑 0..1（main.js 每帧转交给 player）
     get label() { return WEATHER_TYPES[cur].label; },
 
@@ -114,7 +128,7 @@ export function createWeather({
     force(name) {
       if (!WEATHER_TYPES[name] || (name === cur && mix >= 1)) return false;
       next = name;
-      startP = toParams(WEATHER_TYPES[cur]); // 定格当前天气为混合起点
+      startP = currentP; // 从当前画面接续，过渡中强制变天也不跳回旧预设
       mix = 0;
       announced = false;
       return true;
@@ -125,10 +139,11 @@ export function createWeather({
       timer -= dt;
       if (mix >= 1 && timer <= 0) {
         next = pickNext(cur);
-        startP = toParams(WEATHER_TYPES[cur]); // 定格当前天气为混合起点
+        startP = currentP; // 从当前画面接续，过渡中强制变天也不跳回旧预设
         mix = 0;
         announced = false;
       }
+      const transitioning = mix < 1;
       // 过渡推进（14s 缓动）
       if (mix < 1) {
         mix = Math.min(1, mix + dt / 14);
@@ -140,8 +155,8 @@ export function createWeather({
         }
       }
 
-      const targetP = toParams(WEATHER_TYPES[mix >= 1 ? cur : next]);
-      const p = mix >= 1 ? targetP : blendParams(startP, targetP, smooth(mix));
+      const targetP = presets[mix >= 1 ? cur : next];
+      const p = currentP = mix >= 1 ? targetP : blendParams(startP, targetP, smooth(mix));
       weather.wet = p.wet;
 
       // ---- 灯光 / 雾 / 曝光 / 云 / 太阳 sprite ----
@@ -153,24 +168,18 @@ export function createWeather({
       fog.color.copy(p.fogColor);
       fog.near = p.fogNear;
       fog.far = p.fogFar;
-      renderer.toneMappingExposure = p.exp;
+      weather.exposure = p.exp;
       sunSprite.material.opacity = 0.85 * p.sunSprite;
       for (const c of clouds) {
         c.material.opacity = Math.min(1, c.userData.baseO * p.cloudMul);
         c.material.color.copy(p.cloudTint);
       }
 
-      // ---- 天穹重绘 + 环境重烘（0.25s 节流，仅过渡期间发生）----
+      // ---- 天穹重绘 + 环境重烘（0.5s 节流，仅过渡期间发生）----
       repaintCd -= dt;
-      if (mix < 1 && repaintCd <= 0) {
-        repaintCd = 0.25;
-        painter.repaint({
-          zenith: hex(p.zenith), mid: hex(p.mid), horizon: hex(p.horizon),
-          g1: hex(p.g1), g2: hex(p.g2), g3: hex(p.g3), sunGlow: p.sunGlow,
-        });
-        const old = scene.environment;
-        scene.environment = pmrem.fromEquirectangular(painter.tex).texture;
-        if (old) old.dispose();
+      if (transitioning && (repaintCd <= 0 || mix === 1)) {
+        repaintCd = 0.5;
+        refreshSky(p);
       }
 
       // ---- 雨 ----

@@ -173,7 +173,44 @@ const glassMat = new THREE.MeshPhysicalMaterial({
   transparent: true, opacity: 0.85, envMapIntensity: 2.4,
 });
 const rimMat = new THREE.MeshStandardMaterial({ color: 0xd6d9dd, metalness: 1.0, roughness: 0.22 });
-const trimMat = new THREE.MeshStandardMaterial({ color: 0x22252a, metalness: 0.6, roughness: 0.45 });
+const PARTS = {
+  ferrari: { paint: /^(body_color|_0098_dodgerblue)$/, glass: /^glass_gray$/, rubber: /^tires$/, trim: /^plastic_gray$/ },
+  yu7: { paint: /^carpaint$/, glass: /^(windows|d_glass)$/, rubber: /^tyre_3$/, rim: /^(yu7rim_c1|rim_c2)$/, trim: /^(plastic_sh|black_mat|dark_gray_map)$/ },
+  jeep392: { paint: /^jmi_1355060001_004$/, glass: /^glass$/, lens: /^(red_glass|orange_glass)$/, rim: /^jmi_rim_002$/, trim: /^jmi_plastic1$/ },
+};
+
+function tuneCarPart(source, role, paintColor) {
+  let mat;
+  if ((role === 'paint' || role === 'glass') && !source.isMeshPhysicalMaterial) {
+    mat = new THREE.MeshPhysicalMaterial();
+    // Copy the standard PBR channels and render state without dropping source maps.
+    THREE.MeshStandardMaterial.prototype.copy.call(mat, source);
+    mat.defines = { STANDARD: '', PHYSICAL: '' };
+  } else {
+    mat = source.clone();
+  }
+  if (role === 'paint') {
+    mat.color.copy(paintColor);
+    Object.assign(mat, { metalness: 0.12, roughness: mat.roughnessMap ? 0.48 : 0.35,
+      clearcoat: 0.82, clearcoatRoughness: 0.14, envMapIntensity: 1.22, specularIntensity: 0.85 });
+  } else if (role === 'glass') {
+    // Tinted glazing with a single transparent layer; avoid another scene transmission pass.
+    mat.color.setHex(0x263541);
+    Object.assign(mat, { transmission: 0, metalness: 0, roughness: 0.16,
+      transparent: true, opacity: 0.76, depthWrite: false, envMapIntensity: 1.25 });
+  } else if (role === 'lens') {
+    // Keep the source tint without a full-scene transmission pass for small lenses.
+    Object.assign(mat, { transmission: 0, roughness: 0.22, transparent: true,
+      opacity: 0.72, depthWrite: false });
+  } else if (role === 'rubber') {
+    Object.assign(mat, { metalness: 0, roughness: 0.96, envMapIntensity: 0.42 });
+  } else if (role === 'rim') {
+    Object.assign(mat, { metalness: 0.74, roughness: 0.34, envMapIntensity: 1 });
+  } else {
+    Object.assign(mat, { metalness: 0, roughness: 0.72, envMapIntensity: 0.65 });
+  }
+  return mat;
+}
 
 export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
   const group = template.clone(true);
@@ -185,16 +222,40 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
     paintColor.getHSL(hsl);
     paintColor.setHSL(hsl.h, Math.min(1, hsl.s * 1.05), Math.min(0.9, hsl.l * 1.18 + 0.02));
   }
-  const paint = new THREE.MeshPhysicalMaterial({
+  const parts = Object.hasOwn(PARTS, wheelOpts?.id) ? PARTS[wheelOpts.id] : null;
+  const partMaterials = new Map();
+  const ownedMaterials = new Set();
+  let paint = parts ? null : new THREE.MeshPhysicalMaterial({
     // v2.31 车漆修正：旧配方 metalness 0.75 会让漫反射几乎归零（金属只有镜面反射），
     // 深色漆只剩天空反射 → 整台车发黑。改成与程序化车模 paintMat 一致的
     // "介电底漆 + 清漆"：底色漆金属度 0.15 保住饱和度与明度，清漆层负责天空反射高光。
     color: paintColor, metalness: 0.15, roughness: 0.30,
     clearcoat: 1.0, clearcoatRoughness: 0.06, envMapIntensity: 1.35,
   });
+  if (paint) ownedMaterials.add(paint);
   group.traverse((o) => {
     if (!o.isMesh) return;
     o.castShadow = true;
+    if (parts) {
+      const tune = (source) => {
+        if (!source?.isMeshStandardMaterial) return source;
+        const name = source.name.toLowerCase();
+        let role = Object.keys(parts).find((k) => parts[k].test(name));
+        if (wheelOpts.id === 'jeep392' && /ani_wheel/i.test(o.name) && role === 'trim') role = 'rubber';
+        if (wheelOpts.id === 'ferrari' && /^rim(?:_|$)/i.test(o.name) && name === 'metal_gray') role = 'rim';
+        if (!role) return source;
+        const key = source.uuid + ':' + role;
+        if (!partMaterials.has(key)) {
+          const mat = tuneCarPart(source, role, paintColor);
+          partMaterials.set(key, mat);
+          ownedMaterials.add(mat);
+          if (role === 'paint') paint ||= mat;
+        }
+        return partMaterials.get(key);
+      };
+      o.material = Array.isArray(o.material) ? o.material.map(tune) : tune(o.material);
+      return;
+    }
     const n = (o.name || '').toLowerCase();
     const mn = (Array.isArray(o.material) ? o.material[0]?.name : o.material?.name || '').toLowerCase();
     // 车漆匹配：'blue' 是 ferrari 的第二块喷漆面板；'paint' 是 tesla/g63 的 car_paint；
@@ -202,7 +263,7 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
     if (n.includes('body') || n === 'blue' || mn.includes('paint') || mn.includes('body')) o.material = paint;
     // 玻璃匹配：ferrari 按网格名，tesla 按材质名 'windows'
     else if (n.includes('glass') || mn.includes('window') || mn.includes('glass')) o.material = glassMat;
-    else if (n.includes('rim') || n.includes('trim')) o.material = rimMat;
+    else if (splitTokens(n).includes('rim')) o.material = rimMat;
   });
   // 轮子收集（两层结构：wheels = 每轮一组）：
   // 1) 名字 token 精确匹配 wheel/rim/tyre/tire（裸 includes 会误伤 'trim'→'rim'、
@@ -321,8 +382,12 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
     }
     return { meshes: rolling, static: statics, steer: i < 2 };
   });
-  addContactShadow(group);
-  return { group, wheels, paint };
+  const contact = addContactShadow(group, parts ? groups : null);
+  return { group, wheels, paint, dispose() {
+    contact.geometry.dispose();
+    contact.material.dispose();
+    for (const mat of ownedMaterials) mat.dispose();
+  } };
 }
 
 // 假接触阴影（接地感）：径向渐变软阴影，避免生硬矩形边缘
@@ -339,15 +404,24 @@ const _shadowTex = (() => {
   return new THREE.CanvasTexture(c);
 })();
 
-function addContactShadow(group) {
+function addContactShadow(group, wheelGroups) {
+  let width = 2.7, length = 5.2, x = 0, z = 0;
+  if (wheelGroups?.length === 4) {
+    const box = new THREE.Box3().setFromPoints(wheelGroups.map(({ center }) => center));
+    width = THREE.MathUtils.clamp(box.max.x - box.min.x + 0.8, 1.85, 2.8);
+    length = THREE.MathUtils.clamp(box.max.z - box.min.z + 1.35, 3.3, 4.8);
+    x = (box.min.x + box.max.x) / 2;
+    z = (box.min.z + box.max.z) / 2;
+  }
   const ao = new THREE.Mesh(
-    new THREE.PlaneGeometry(2.7, 5.2),
+    new THREE.PlaneGeometry(width, length),
     new THREE.MeshBasicMaterial({ map: _shadowTex, transparent: true, depthWrite: false })
   );
   ao.rotation.x = -Math.PI / 2;
-  ao.position.y = 0.045;
+  ao.position.set(x, 0.045, z);
   ao.renderOrder = 1;
   group.add(ao);
+  return ao;
 }
 // ---- 程序化兜底车（GLB 加载失败时用）：由 cars.js 轮廓车工厂提供 ----
 
@@ -360,6 +434,7 @@ export class PlayerCar {
     this.wheels = (built.wheels || []).map((w, i) =>
       w && w.meshes ? w : { meshes: [w], steer: i < 2 });
     this.paint = built.paint;
+    this.disposeModel = built.dispose;
     this.spec = spec;
     this.pos = new THREE.Vector3();
     this.yaw = 0;
@@ -389,6 +464,8 @@ export class PlayerCar {
     }
     this.wheels = (built.wheels || []).map((w, i) =>
       w && w.meshes ? w : { meshes: [w], steer: i < 2 });
+    this.disposeModel?.();
+    this.disposeModel = built.dispose;
     this.paint = built.paint;
     this.spec = spec;
   }

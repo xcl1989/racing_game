@@ -231,7 +231,7 @@ export function createComposer(renderer, scene, camera, enable, useGTAO = false,
     }
   }
   const bloom = new UnrealBloomPass(
-    new THREE.Vector2(window.innerWidth, window.innerHeight), bloomStrength, 0.55, 0.82
+    new THREE.Vector2(window.innerWidth, window.innerHeight), bloomStrength, 0.45, 1.25
   );
   composer.addPass(bloom);
   composer.addPass(new OutputPass());

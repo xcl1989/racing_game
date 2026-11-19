@@ -8,9 +8,11 @@ import { DustSystem, SmokeSystem, SkidMarks, RainSystem, createComposer, EngineA
 import { initInput, input, toggleGyro, pollInput } from './input.js';
 import { Game } from './game.js';
 import { buildWorld } from './world.js';
-import { upgradeRealism, setRoadWet } from './realism.js'; // v2.15 环境材质真实化 + v2.21 湿路反射
+import { upgradeRealism } from './realism.js';
+import { setRoadWet } from './roads.js';
 import { makeGlowTexture, makeCloudTexture, createSkyPainter } from './textures.js';
 import { createWeather } from './weather.js';
+import { createOutdoorEnvironment, SUN_DIRECTION, SUN_OFFSET } from './environment.js';
 import { CAR_SPECS } from './cars.js';
 import { SaveManager } from './save.js'; // v2.32 存档管理（3 槽位 localStorage）
 
@@ -40,8 +42,7 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 // 天幕：equirect 渐变天穹（几何球方案曾渲染黑块，弃用；贴图背景无此坑）
-// 天穹同时烘焙环境反射，光照与背景同源，金属/玻璃不会"棚拍感"
-// v2.10 起天穹可重绘：weather.js 在天气过渡时 repaint + 重烘 PMREM
+// 可见天幕与反射探针共用天气色板和太阳方位。
 const skyPainter = createSkyPainter();
 const skyTex = skyPainter.tex;
 scene.background = skyTex;
@@ -50,12 +51,9 @@ scene.fog = new THREE.Fog(0xd7e9f5, 340, 2700);
 const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.5, 2500);
 camera.position.set(0, 5, -12);
 
-// 环境反射：直接由天穹 equirect 烘焙（PMREM），与所见天空一致
+// The visible sky stays lightweight; a linear HDR probe drives PBR lighting.
 const pmrem = new THREE.PMREMGenerator(renderer);
-function bakeEnvironment() {
-  return pmrem.fromEquirectangular(skyTex).texture;
-}
-scene.environment = bakeEnvironment();
+const bakeOutdoorEnvironment = createOutdoorEnvironment(pmrem);
 
 // ---- 灯光 ----
 const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x556a40, 0.62); // v2.13 与 sunny 预设同步
@@ -75,8 +73,8 @@ const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
   map: makeGlowTexture(), color: 0xfff4cc, transparent: true,
   opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false,
 }));
-sunSprite.position.set(700, 900, -600);
-sunSprite.scale.set(190, 190, 1);
+sunSprite.position.copy(SUN_DIRECTION).multiplyScalar(1700);
+sunSprite.scale.set(75, 75, 1);
 sunSprite.material.fog = false;
 scene.add(sunSprite);
 
@@ -232,9 +230,8 @@ const dust = new DustSystem(scene);
 const skids = new SkidMarks(scene);
 const smoke = new SmokeSystem(scene, quality ? 46 : 24);
 const audio = new EngineAudio();
-// v2.22：后期管线全端开启（手机裸渲染无 Bloom = 高光不泛光，是"看起来假"的主因）；
-// 档位差异：桌面高=GTAO+bloom0.35+2x 像素比，手机/低档=bloom0.25+1.25x
-let composer = createComposer(renderer, scene, camera, true, quality, quality ? 0.35 : 0.25);
+// 户外泛光保留给高亮信标；高画质额外启用 GTAO。
+const composer = createComposer(renderer, scene, camera, true, quality, quality ? 0.18 : 0.10);
 
 // ---- 游戏与输入 ----
 const game = new Game({ track, player, ais, dust, skids, smoke, audio, world, traffic });
@@ -246,7 +243,7 @@ game.toMenu();
 // ---- 天气系统：晴/多云/阴/雨动态切换（雨粒子 + 雨声 + 湿滑联动）----
 const rain = new RainSystem(scene, isMobile ? 380 : 900);
 const weather = createWeather({
-  scene, renderer, painter: skyPainter, pmrem,
+  scene, painter: skyPainter, bakeEnvironment: bakeOutdoorEnvironment,
   hemi, sun, sunSprite, clouds, fog: scene.fog,
   rain, audio,
   onNotice: (n) => game.toast(`天气转${n}了`, 2600),
@@ -475,18 +472,18 @@ const showroomScene = new THREE.Scene(); // v2.16.1 补声明：原代码直接�
   // --- 灯光：4 盏暖白工作灯（均匀）+ 主聚光（阴影）+ 窗光斜射 ---
   const workLamps = [];
   for (const z of [-6, -2, 2, 6]) {
-    const pl = new THREE.PointLight(0xffe9c8, 26, 0, 1.9);
+    const pl = new THREE.PointLight(0xffead5, 17, 0, 2);
     pl.position.set(0, ROOM.h - 0.9, z);
     showroomScene.add(pl);
     workLamps.push(pl);
   }
-  const key = new THREE.SpotLight(0xffffff, 260, 0, 0.62, 0.55, 1.6);
+  const key = new THREE.SpotLight(0xfff5e9, 118, 0, 0.68, 0.65, 2);
   key.position.set(3, ROOM.h - 0.4, 4);
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
   key.shadow.bias = -0.0004;
   showroomScene.add(key, key.target);
-  const winLight = new THREE.DirectionalLight(0xdfe8f2, 1.0);
+  const winLight = new THREE.DirectionalLight(0xdfe8f2, 0.62);
   winLight.position.set(-4, 6, -14);
   winLight.target.position.set(2, 0, 6);
   showroomScene.add(winLight, winLight.target);
@@ -495,8 +492,21 @@ const showroomScene = new THREE.Scene(); // v2.16.1 补声明：原代码直接�
 
 // 展厅环境反射：RoomEnvironment 中性室内（车漆反射真实、不反户外天空）
 // RoomEnvironment 已在文件头 import（line 3）—— 重复 import 会导致整模块解析失败
-const showroomEnv = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-showroomScene.environment = showroomEnv;
+const studioProbe = new RoomEnvironment();
+const showroomEnv = pmrem.fromScene(studioProbe, 0.04);
+studioProbe.traverse((object) => {
+  object.geometry?.dispose();
+  object.material?.dispose();
+});
+showroomScene.environment = showroomEnv.texture;
+
+function syncRenderProfile() {
+  composer.renderPass.scene = showroom ? showroomScene : scene;
+  if (composer.gtao) composer.gtao.enabled = quality && !showroom;
+  composer.bloom.enabled = !showroom;
+  composer.bloom.strength = quality ? 0.18 : 0.10;
+  renderer.toneMappingExposure = showroom ? 0.82 : weather.exposure;
+}
 
 function renderCarInfo(spec) {
   // v2.20 属性条动态归一：分母不再硬编码（旧 norm 随参数上调溢出失真），
@@ -587,9 +597,7 @@ function confirmCar() {
 function showroomExit() {
   showroom = false;
   scene.add(player.group);
-  if (composer.passes[1]) composer.passes[1].strength = 0.35; // 恢复主世界 bloom
-  if (composer.gtao) composer.gtao.enabled = true; // v2.21 恢复 GTAO（深度/法线来自主场景）
-  composer.passes[0].scene = scene;
+  syncRenderProfile();
 }
 
 function buildCarCards() { // 兼容层：隐藏卡片，onclick 走确认逻辑（测试点击入口）
@@ -619,9 +627,7 @@ function openCarSelect(purpose = 'new') {
   // 车模挂进展厅场景、落座展台；RenderPass 热切渲染目标（真实车库 bloom 调弱）
   showroomScene.add(player.group);
   player.reset({ x: 0, y: 0.17, z: 0 }, Math.PI / 2);
-  composer.passes[0].scene = showroomScene;
-  if (composer.gtao) composer.gtao.enabled = false; // v2.21 展厅关 GTAO：AO 混入主场景深度会出错
-  if (composer.passes[1]) composer.passes[1].strength = 0.12;
+  syncRenderProfile();
   showCar(carIdx);
 }
 $('btn-start').onclick = () => openCarSelect('new');
@@ -638,7 +644,7 @@ window.carDebug = {
   templates: CAR_TEMPLATES,
   open: () => openCarSelect(),
   show: (i) => showCar(i),
-  close: () => { $('carSelect').style.display = 'none'; showroom = false; },
+  close: closeSelectUI,
   orbit: (yaw) => { look.yaw = yaw; look.pitch = 0; }, // 展厅环绕角：0=车尾, π=车头
   wheels: () => player.wheels,
   idx: () => carIdx,
@@ -656,8 +662,8 @@ window.addEventListener('keydown', (e) => {
 $('btn-quality').onclick = () => {
   quality = !quality;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, quality ? 2 : 1.25));
-  if (composer.gtao) composer.gtao.enabled = quality;
-  if (composer.bloom) composer.bloom.strength = quality ? 0.35 : 0.2;
+  composer.setPixelRatio(renderer.getPixelRatio());
+  syncRenderProfile();
   $('btn-quality').textContent = `特效: ${quality ? '高' : '低'}`;
 };
 $('btn-sound').onclick = () => {
@@ -832,7 +838,7 @@ function updateCamera(dt, shake) {
   camera.fov += (60 + sk * 12 - camera.fov) * k;  // v2.30：62+16→60+12，高速 FOV 78→72 减畸变
   camera.updateProjectionMatrix();
   // 阴影相机跟随玩家
-  sun.position.copy(player.pos).add({ x: 60, y: 110, z: 45 });
+  sun.position.copy(player.pos).add(SUN_OFFSET);
   sun.target.position.copy(player.pos);
   // 速度晕影
   $('vignette').style.opacity = (sk * sk * 0.55).toFixed(2);
@@ -847,9 +853,11 @@ function animate() {
   const shake = game.update(dt, input);
   game.drawBigMap(); // 大地图动态层（打开地图=暂停，update 早退也要刷新标记/路线）
   updateCamera(dt, shake);
+  sunSprite.position.copy(camera.position).addScaledVector(SUN_DIRECTION, 1700);
   weather.update(dt, camera.position); // 天气：天穹/光照/雾/雨粒子/湿滑
   player.wet = weather.wet;            // 雨天抓地下降（car.js 读取）
-  setRoadWet(weather.wet);             // v2.21 湿路反射：路网材质随湿滑系数变镜面
+  setRoadWet(weather.wet);             // Visual response depends on road material.
+  renderer.toneMappingExposure = showroom ? 0.82 : weather.exposure;
   if (showroom) {
     // 展厅：固定 RoomEnvironment 室内反射（车漆不反户外天空），渲染车库场景
     if (composer.enabled) composer.render();

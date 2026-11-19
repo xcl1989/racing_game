@@ -1,7 +1,9 @@
 // world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线 / 国道 / 盘山公路
 import * as THREE from 'three';
+import { createRoadMaterial } from './roads.js';
+import { boxBatch } from './scene-detail.js';
 import {
-  makeAsphaltTextures, makeLaneTextures, makeHighwayTextures,
+  makeAsphaltTextures, makeLaneTextures, makeHighwayTextures, makeJunctionTextures,
   makeGrassTexture, makeWaterNormal, makeDirtTextures,
   makeFacadeTexture, makeFacadeEmissive, makeGlassTexture,
 } from './textures.js';
@@ -12,9 +14,7 @@ import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材�
 // matOpts.follow = 侧点贴地形偏移量（v2.14.3）：坡地路段路面左右两边各自采样地形高度，
 // 避免"横向平直路面在坡上一侧悬空"（野径/湖西环路过湖盆坡带时的悬空路）
 let terrainSampler = null; // buildWorld 烘焙地形后注入（ribbon 在模块顶层，作用域隔离）
-// v2.21：全路网材质注册表 —— realism.js setRoadWet() 按天气湿滑系数改 roughness/envMap
-export const roadMaterials = [];
-// v2.33 缘石后处理：ribbon 只登记缘石作业（顶点+每段中心点），全部路建完后统一生成，
+// v2.33 缘石后处理：ribbon 先登记，全部道路建完后统一生成。
 // 在与其他路面交叉处自动断开——旧版缘石横穿垂直路口的路面（白条压路，audit_08）
 const kerbJobs = [];      // {id, cv, quadCenters, group}
 const ribbonRegistry = []; // {id, samples, width, tex}
@@ -63,17 +63,11 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   g.computeVertexNormals();
   // v2.21：贴图工厂已单例化（make*Textures 内部缓存），直接共享实例不再 clone
   //（repeat 恒 (1,1)，旧 clone 是每路独立 GPU 纹理 —— 1024px 时代共享反而省 20 份显存）
-  const map = asphalt.map;
-  const normal = asphalt.normal;
-  // 土路贴图仍可能无粗糙度图 → 回退纯粗糙度
-  const roughTex = asphalt.roughness || null;
-  const matOpts2 = { ...matOpts };
-  if (roughTex) matOpts2.roughnessMap = roughTex; // 不传 undefined（THREE 会告警）
-  const mat = new THREE.MeshStandardMaterial({
-    map, normalMap: normal, normalScale: new THREE.Vector2(0.7, 0.7),
-    roughness: 0.92, metalness: 0.04, envMapIntensity: 0.5, ...matOpts2,
+  const { follow, minY, segLen, curb = true, ...surfaceOptions } = matOpts;
+  const mat = createRoadMaterial(tex === 3 ? 'dirt' : 'asphalt', {
+    map: asphalt.map, normalMap: asphalt.normal, roughnessMap: asphalt.roughness ?? null,
+    normalScale: new THREE.Vector2(0.7, 0.7), ...surfaceOptions,
   });
-  roadMaterials.push(mat); // 注册进湿路反射系统（realism.js setRoadWet）
   const roadMesh = new THREE.Mesh(g, mat);
   roadMesh.receiveShadow = true;
   const samples = [];
@@ -96,7 +90,7 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
     if (Number.isFinite(edgeL[i])) edgeMax = Math.max(edgeMax, edgeL[i]);
     if (Number.isFinite(edgeR[i])) edgeMax = Math.max(edgeMax, edgeR[i]);
   }
-  if (tex !== 3 && edgeMax <= 15) {
+  if (curb && tex !== 3 && edgeMax <= 15) {
     const CH = 0.10, CW = 0.3;           // 缘石高/宽
     const cv = [], cidx = [];
     const quadCenters = [];              // 每段每侧缘石条带的中心（交叉处断开判定用）
@@ -171,7 +165,7 @@ function attachCurbs() {
     }
     return false;
   };
-  const curbMat = new THREE.MeshStandardMaterial({
+  const curbMat = createRoadMaterial('concrete', {
     color: 0xa6a9ad, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
   });
   let kept = 0, cut = 0;
@@ -231,14 +225,14 @@ export function buildWorld(scene) {
   //    纵街 z 跨 84..616（与横街 z=90/610 的远边缘齐平），横街 x 跨 804..1296
   //    —— 旧版两端多伸出 60m 直插草地，形成"断头路"
   const cityStreets = [];
-  const CX = 1050, CZ = 350;
+  const signalJunctions = [[1050, 220], [1050, 480], [930, 350], [1170, 350]];
   const xs = [810, 930, 1050, 1170, 1290];
   const zs = [90, 220, 350, 480, 610];
   const Y_STREET = 0.012, Y_AVE = 0.026;
   for (const sx of xs) {
     const r = ribbon(
       [new THREE.Vector3(sx, Y_STREET, zs[0] - 6), new THREE.Vector3(sx, Y_STREET, zs[4] + 6)],
-      false, 12, { roughness: 0.92 }
+      false, 12, { roughness: 0.92, curb: false }
     );
     group.add(r.mesh);
     cityStreets.push({ ax: sx, az: zs[0] - 6, bx: sx, bz: zs[4] + 6, width: 12 });
@@ -246,7 +240,7 @@ export function buildWorld(scene) {
   for (const sz of zs) {
     const r = ribbon(
       [new THREE.Vector3(xs[0] - 6, Y_AVE, sz), new THREE.Vector3(xs[4] + 6, Y_AVE, sz)],
-      false, 12, { roughness: 0.92 }
+      false, 12, { roughness: 0.92, curb: false }
     );
     group.add(r.mesh);
     cityStreets.push({ ax: xs[0] - 6, az: sz, bx: xs[4] + 6, bz: sz, width: 12 });
@@ -260,7 +254,7 @@ export function buildWorld(scene) {
   for (const sx of laneXs) {
     const r = ribbon(
       [new THREE.Vector3(sx, Y_LANE, zs[0] - 6), new THREE.Vector3(sx, Y_LANE, zs[4] + 6)],
-      false, 9, { roughness: 0.95 }, 1
+      false, 9, { roughness: 0.95, curb: false }, 1
     );
     group.add(r.mesh);
     cityStreets.push({ ax: sx, az: zs[0] - 6, bx: sx, bz: zs[4] + 6, width: 9 });
@@ -268,7 +262,7 @@ export function buildWorld(scene) {
   for (const sz of laneZs) {
     const r = ribbon(
       [new THREE.Vector3(xs[0] - 6, Y_LANE, sz), new THREE.Vector3(xs[4] + 6, Y_LANE, sz)],
-      false, 9, { roughness: 0.95 }, 1
+      false, 9, { roughness: 0.95, curb: false }, 1
     );
     group.add(r.mesh);
     cityStreets.push({ ax: xs[0] - 6, az: sz, bx: xs[4] + 6, bz: sz, width: 9 });
@@ -277,20 +271,16 @@ export function buildWorld(scene) {
   // 城市行驶路线（NPC 环线）：只保留曲线供车流使用，不铺实体路面
   // —— 旧版沿街再铺一条 2.6cm 高的路，与街道长距离平行共面会闪
   const Y_ROUTE = 0.03;
-  const cityRoutePts = [
-    new THREE.Vector3(1050, Y_ROUTE, 90),
-    new THREE.Vector3(1050, Y_ROUTE, 220),
-    new THREE.Vector3(1170, Y_ROUTE, 290),
-    new THREE.Vector3(1170, Y_ROUTE, 350),
-    new THREE.Vector3(1170, Y_ROUTE, 480),
-    new THREE.Vector3(1050, Y_ROUTE, 550),
-    new THREE.Vector3(930, Y_ROUTE, 480),
-    new THREE.Vector3(930, Y_ROUTE, 350),
-    new THREE.Vector3(930, Y_ROUTE, 220),
-    new THREE.Vector3(930, Y_ROUTE, 90),
-  ];
-  const cityRoute = ribbon(cityRoutePts, true, 12);
-  // 不 add(cityRoute.mesh)：路线隐于街道之下，车流直接"开在"街道上
+  const corners = [[930,90],[1170,90],[1170,480],[930,480]]
+    .map(([x,z]) => new THREE.Vector3(x,Y_ROUTE,z));
+  const approach = (corner, neighbor) => corner.clone().lerp(neighbor, 11 / corner.distanceTo(neighbor));
+  const trafficCurve = new THREE.CurvePath();
+  for (let i = 0; i < corners.length; i++) {
+    const before = corners[(i + 3) % 4], corner = corners[i], after = corners[(i + 1) % 4];
+    trafficCurve.add(new THREE.LineCurve3(approach(before, corner), approach(corner, before)));
+    trafficCurve.add(new THREE.QuadraticBezierCurve3(approach(corner, before), corner, approach(corner, after)));
+  }
+  const cityRoute = { curve: trafficCurve, length: trafficCurve.getLength() };
 
   // ---- 高速连接大道：城市 ↔ 高速的匝道风格直线接入 ----
   // 动态采样高速样条找最近点；端点伸过高速中线 4m 保证无缝衔接且不戳出对侧
@@ -340,17 +330,16 @@ export function buildWorld(scene) {
   }
 
   // ---- 城市北大道（v2.13）：城市北出口 ↔ 高速东北段，补齐城市四向出口 ----
-  // 起点东挪 30m（x=1080）与南连接大道起点错开，避免同点出发共面搭接
+  // 沿现有纵街延伸，避免从相邻街道之间斜接。
   let northConnPts, northConnRoad;
   {
     const hp = nearestCurvePoint(highway.curve, 1250, 900, (p) => p.z > 760);
     northConnPts = [
-      new THREE.Vector3(1080, Y_CONN, zs[4] + 6),
-      new THREE.Vector3(1105, Y_CONN, 700),
-      new THREE.Vector3(1160, Y_CONN, 790),
-      new THREE.Vector3(1220, Y_CONN, hp.z - 40),
-      new THREE.Vector3(hp.x + 18, Y_CONN, hp.z - 8),
-      new THREE.Vector3(hp.x + 4, Y_CONN, hp.z),
+      new THREE.Vector3(1170, Y_CONN, zs[4]),
+      new THREE.Vector3(1170, Y_CONN, 665),
+      new THREE.Vector3(1190, Y_CONN, 760),
+      new THREE.Vector3(hp.x, Y_CONN, hp.z - 36),
+      new THREE.Vector3(hp.x, Y_CONN, hp.z),
     ];
     northConnRoad = ribbon(northConnPts, false, 14, { roughness: 0.9 });
     group.add(northConnRoad.mesh);
@@ -706,30 +695,23 @@ export function buildWorld(scene) {
   // ---- 桥（跨下切河道：桥面 y=1.2 高出水面 2.7m；梁 + 4 桥墩入水）----
   // ⚠️ 旧版栏杆沿 Z 摆放与过河方向垂直（等于横在路中间的栅栏），已纠正
   const bridgeCenter = new THREE.Vector3(RIVER_X, 0, 60);
-  const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x9aa2ab, roughness: 0.6, metalness: 0.4 });
-  const railMat = new THREE.MeshStandardMaterial({ color: 0xc8ccd2, metalness: 0.7, roughness: 0.4 });
-  // 主梁：桥面下的承重梁（跨河方向，顶面低于桥面 25cm 防共面）
-  const girder = new THREE.Mesh(new THREE.BoxGeometry(140, 0.7, 10), bridgeMat);
-  girder.position.set(bridgeCenter.x, 0.6, bridgeCenter.z);
-  girder.castShadow = true;
-  group.add(girder);
-  for (const px of [-865, -895, -905, -935]) { // 桥墩：立在桥面两侧水中（不入路面）
-    for (const pz of [-6.5, 6.5]) {
-      const pillar = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.8, 8, 8), bridgeMat);
-      pillar.position.set(px, -0.8, bridgeCenter.z + pz);
-      group.add(pillar);
-    }
+  const bridgeConcrete = createRoadMaterial('concrete', {color:0x8c887f,roughness:.9});
+  const bridgeSteel = new THREE.MeshStandardMaterial({color:0x505b59,roughness:.64,metalness:.5});
+  const supports = [], steelwork = [];
+  for (const x of [-936,-912,-888,-864]) {
+    supports.push([x,-1.76,60,2.0,5.0,6.2], [x,.53,60,3.3,.45,8.6]);
   }
-  for (const side of [-1, 1]) {
-    for (const dy of [1.9, 2.3]) {
-      const rail = new THREE.Mesh(
-        new THREE.BoxGeometry(140, 0.16, 0.3), // 沿 X：与桥面同向
-        railMat
-      );
-      rail.position.set(bridgeCenter.x, dy, bridgeCenter.z + side * 4.6);
-      group.add(rail);
+  supports.push([-900,.76,61,80,.52,10.8]);
+  for (const side of [-1,1]) {
+    const z=61+side*5.22;
+    for (let x=-940;x<=-860;x+=4) {
+      supports.push([x,1.25,z,.34,.24,.46]);
+      steelwork.push([x,1.82,z,.12,1.08,.14]);
     }
+    steelwork.push([-900,1.59,z,80,.12,.14],[-900,2.18,z,80,.12,.16]);
   }
+  boxBatch(group,'bridge-concrete',bridgeConcrete,supports,true);
+  boxBatch(group,'bridge-rails',bridgeSteel,steelwork,true);
 
   // ---- 河流（v2.24 水面材质升级：波浪/菲涅尔/泡沫 + 世界坐标岸线场）----
   // 水线由地形反推：cutBand(|x+900|,20,60,2.2) 中 h=-1.5 处 ≈ |x+900|=34.4，
@@ -792,7 +774,7 @@ export function buildWorld(scene) {
       map.repeat.set(2, ry); ems.repeat.set(2, ry);
       const mat = new THREE.MeshStandardMaterial({
         color: 0xffffff, map, emissiveMap: ems,
-        emissive: 0xffdd88, emissiveIntensity: 0.35,
+        emissive: 0xffdd88, emissiveIntensity: 0.12,
         roughness: 0.85, metalness: 0.06, envMapIntensity: 0.55,
       });
       const mesh = new THREE.InstancedMesh(bldGeo, mat, N_BLD);
@@ -810,7 +792,7 @@ export function buildWorld(scene) {
       const map = glassBase.clone(); map.needsUpdate = true;
       map.repeat.set(2, Math.max(3, Math.round(hRef / 10))); // tile ≈ 3 层楼
       const mat = new THREE.MeshStandardMaterial({
-        color: 0xdfe8ec, map, metalness: 0.55, roughness: 0.24, envMapIntensity: 1.5,
+        color: 0xc4ced0, map, metalness: 0.24, roughness: 0.36, envMapIntensity: 0.95,
       });
       const mesh = new THREE.InstancedMesh(bldGeo, mat, N_GLASS);
       mesh.castShadow = true;
@@ -824,6 +806,24 @@ export function buildWorld(scene) {
     rooftops.castShadow = true;
     const dummy = new THREE.Object3D();
     const tint = new THREE.Color();
+    const masonry = [], frames = [], glazing = [];
+    function buildingDetails(x,z,w,h,d,glass) {
+      masonry.push([x,1.65,z,w+.025,3.3,d+.025], [x,h+.22,z,w+.026,.44,d+.026]);
+      for (const side of [-1,1]) {
+        for (const end of [-1,1]) {
+          masonry.push([x+side*(w/2-.32),h*.52,z+end*(d/2-.32),.69,h*.94,.69]);
+        }
+        for (const level of [3.35, h*.56]) {
+          frames.push([x,level,z+side*(d/2-.08),w,.42,.2], [x+side*(w/2-.08),level,z,.2,.42,d]);
+        }
+        for (let i=-2;i<=2;i++) {
+          const zw=z+i*d/6, xw=x+i*w/6;
+          // The opaque plinth is recessed from these glass panels by 2 cm.
+          glazing.push([x+side*(w/2+.022),1.75,zw,.045,2.35,d*.145], [xw,1.75,z+side*(d/2+.022),w*.145,2.35,.045]);
+        }
+      }
+      if (glass) frames.push([x,h+1.3,z,w*.47,2.1,d*.51]);
+    }
     let placed = 0, glassPlaced = 0, roofN = 0;
     for (let bi = 0; bi < xs.length - 1; bi++) {
       for (let bj = 0; bj < zs.length - 1; bj++) {
@@ -881,6 +881,7 @@ export function buildWorld(scene) {
             x: dummy.position.x, z: dummy.position.z,
             hw: w / 2, hd: dpt / 2,
           });
+          buildingDetails(dummy.position.x, dummy.position.z, w, h, dpt, false);
           const bucket = bldBuckets[h < 46 ? 0 : h < 74 ? 1 : 2];
           const bi = bucket.userData.cnt;
           if (bi < N_BLD) {
@@ -927,6 +928,7 @@ export function buildWorld(scene) {
             x: dummy.position.x, z: dummy.position.z,
             hw: w / 2, hd: dpt / 2,
           });
+          buildingDetails(dummy.position.x, dummy.position.z, w, h, dpt, true);
           const gbucket = glassBuckets[h < 80 ? 0 : 1];
           const gi = gbucket.userData.cnt;
           if (gi < N_GLASS) {
@@ -950,19 +952,50 @@ export function buildWorld(scene) {
     for (const m of glassBuckets) { m.count = m.userData.cnt; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
     rooftops.count = roofN;
     group.add(...bldBuckets, ...glassBuckets, rooftops);
+    boxBatch(group,'building-plinths',new THREE.MeshStandardMaterial({color:0x797368,roughness:.92}),masonry);
+    boxBatch(group,'building-metalwork',new THREE.MeshStandardMaterial({color:0x545a58,roughness:.63,metalness:.35}),frames);
+    boxBatch(group,'building-street-glazing',new THREE.MeshStandardMaterial({color:0x34484e,roughness:.33,metalness:.16,envMapIntensity:.8}),glazing);
+  }
+
+  // Paint stops at the junction, not across the crossing traffic lanes.
+  {
+    const vertical = cityStreets.filter((s) => s.ax === s.bx).sort((a,b) => a.ax-b.ax);
+    const horizontal = cityStreets.filter((s) => s.az === s.bz).sort((a,b) => a.az-b.az);
+    const patches = [], walks = [], zebra = [];
+    const { map, roughness } = makeJunctionTextures();
+    for (const v of vertical) for (const h of horizontal) {
+      patches.push([v.ax,.040,h.az,v.width+.12,.007,h.width+.12]);
+    }
+    for (const [streets, cuts, alongZ] of [[vertical,horizontal,true],[horizontal,vertical,false]]) {
+      for (const street of streets) for (let i=1;i<cuts.length;i++) {
+        const a=(alongZ?cuts[i-1].az:cuts[i-1].ax)+cuts[i-1].width/2+2;
+        const b=(alongZ?cuts[i].az:cuts[i].ax)-cuts[i].width/2-2;
+        for (const side of [-1,1]) {
+          const offset=(alongZ?street.ax:street.az)+side*(street.width/2+1.04);
+          walks.push(alongZ?[offset,.066,(a+b)/2,1.8,.11,b-a]:[(a+b)/2,.066,offset,b-a,.11,1.8]);
+        }
+      }
+    }
+    for (const [x,z] of signalJunctions) for (const side of [-1,1]) for (let k=-4;k<=4;k++) {
+      zebra.push([x+k*.86,.052,z+side*4.88,.43,.005,1.38], [x+side*4.88,.052,z+k*.86,1.38,.005,.43]);
+    }
+    boxBatch(group,'city-junctions',createRoadMaterial('asphalt',{map,roughnessMap:roughness}),patches);
+    boxBatch(group,'city-sidewalks',createRoadMaterial('concrete',{color:0x938e83}),walks);
+    boxBatch(group,'city-crosswalks',createRoadMaterial('marking',{color:0xdfd8c8}),zebra);
   }
 
   // ---- 红绿灯（城市主要路口，全城同步周期）----
   const lights = [];
   const poleMat = new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.6, metalness: 0.5 });
   const lampMats = [];
-  for (const [lx, lz] of [[1050, 220], [1050, 480], [930, 350], [1170, 350]]) {
+  for (const [lx, lz] of signalJunctions) {
+    const sx = lx + 7.5, sz = lz + 7.5;
     const g2 = new THREE.Group();
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 6.5, 8), poleMat);
-    pole.position.set(lx, 3.25, lz);
+    pole.position.set(sx, 3.25, sz);
     g2.add(pole);
     const box = new THREE.Mesh(new THREE.BoxGeometry(0.9, 2.2, 0.5), poleMat);
-    box.position.set(lx, 6.2, lz);
+    box.position.set(sx, 6.2, sz);
     g2.add(box);
     const lamps = [];
     const cols = [0xff2222, 0xffcc22, 0x22ff44];
@@ -971,7 +1004,7 @@ export function buildWorld(scene) {
         color: 0x111111, emissive: c, emissiveIntensity: 0.1, roughness: 0.4,
       });
       const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 10), m);
-      lamp.position.set(lx, 7.05 - i * 0.85, lz);
+      lamp.position.set(sx, 7.05 - i * 0.85, sz - 0.29);
       g2.add(lamp);
       lamps.push(m);
     });
@@ -1182,8 +1215,7 @@ export function buildWorld(scene) {
 
   // 小地图折线（画全路网）：高速 / 乡道 + 城市街道网格逐条补上
   // ⚠️ 旧版只有 3 条折线，站在城市十字路口地图上空空如也
-  // ⚠️ v2.33 cityRoutePts 不入图：它是隐藏 NPC 车流环线（无实体路面，斜穿街区草地），
-  //    画在图上会变成"小地图有路、实际没路"的幽灵路（用户实机报告）
+  // NPC 曲线只是街道上的行车路径；地图只绘制实际道路。
   const streetPolys = cityStreets.map((s) => [[s.ax, s.az], [s.bx, s.bz]]);
   const minimapPolylines = [
     hPts.map((p) => [p.x, p.z]),

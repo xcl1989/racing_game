@@ -38,16 +38,23 @@ export function buildNavGraph(world, track) {
   road(world.swLink.samples);
   road(world.country.samples, 1.3);
   // ⚠️ world.cityRoute 是隐藏 NPC 环线（无实体路面），与城市街道重复，不入图
-  const cityId = id++;
+  // Every street has its own chain. Put a node exactly at each perpendicular crossing.
   for (const st of world.cityStreets) {
-    const len = Math.hypot(st.bx - st.ax, st.bz - st.az);
-    const n = Math.max(1, Math.round(len / 10));
-    const pts = [];
-    for (let k = 0; k <= n; k++) {
-      const t = k / n;
-      pts.push({ x: st.ax + (st.bx - st.ax) * t, y: 0.02, z: st.az + (st.bz - st.az) * t, w: st.width });
+    const dx = st.bx - st.ax, dz = st.bz - st.az;
+    const n = Math.max(1, Math.round(Math.hypot(dx, dz) / 10));
+    const cuts = Array.from({ length: n + 1 }, (_, i) => i / n);
+    for (const other of world.cityStreets) {
+      if ((dx === 0) === (other.bx === other.ax)) continue;
+      const t = dx === 0 ? (other.az - st.az) / dz : (other.ax - st.ax) / dx;
+      const cross = dx === 0 ? st.ax : st.az;
+      const a = dx === 0 ? other.ax : other.az;
+      const b = dx === 0 ? other.bx : other.bz;
+      if (t > 0 && t < 1 && cross >= Math.min(a,b) && cross <= Math.max(a,b)) cuts.push(t);
     }
-    addPts(cityId, pts);
+    cuts.sort((a,b) => a-b);
+    const pts = cuts.filter((t,i) => !i || t-cuts[i-1] > 1e-6)
+      .map((t) => ({ x:st.ax+dx*t, y:0.02, z:st.az+dz*t, w:st.width }));
+    addPts(id++, pts);
   }
   // 主赛道环道（1m 采样）+ 直线加速赛道
   road(track.samples, 1);

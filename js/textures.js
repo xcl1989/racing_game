@@ -66,7 +66,7 @@ export function normalMapFromHeight(hc, strength = 1.5) {
 //   细砂粒 → 中粒骨料簇 → 修补色斑 → 矩形沥青补丁（四周接缝）→ 井盖（双圈+高光弧）
 //   → 主干+细枝裂纹 → 路缘暗化带（u=0/1 边缘 3.5%，ribbon 的 u 横跨整条路宽，全路型通用）
 //   → 标线磨损侵蚀（在标线带内点噪露底，实线不再"塑料纯色"）
-// 数据图（粗糙度/法线）与颜色图逐特征对齐：油渍更滑、补丁更糙、接缝凹槽、井盖微凸。
+// 数据图（粗糙度/法线）与颜色图逐特征对齐：油渍更滑、补丁更糙、接缝凹槽。
 // 单例缓存：1024px 全套生成 ~80ms，track.js 多次调用与全图 ~20 段路共享一份实例
 // （world.js v2.21 起 ribbon 不再 clone 贴图 —— 共享后 1024 反而比旧 512×20 份更省显存）。
 
@@ -87,9 +87,6 @@ function genAsphaltFeatures(S) {
       x: Math.random() * S * 0.8, y: Math.random() * S * 0.8,
       w: S * (0.05 + Math.random() * 0.11), h: S * (0.02 + Math.random() * 0.04),
       dark: Math.random() < 0.5,
-    })),
-    manholes: Array.from({ length: 2 }, () => ({
-      x: S * (0.18 + Math.random() * 0.64), y: Math.random() * S, r: S * 0.022,
     })),
     stains: Array.from({ length: 5 }, () => ({
       x: Math.random() * S, y: Math.random() * S,
@@ -112,10 +109,10 @@ function genAsphaltFeatures(S) {
 
 function paintAsphaltColor(x, S, F) {
   // v2.22 基底提亮：#3a3d42 偏黑与亮草地对比生硬，真实日晒沥青是中灰
-  x.fillStyle = '#45484e';
+  x.fillStyle = '#585953';
   x.fillRect(0, 0, S, S);
-  noise(x, S, S, S * S * 0.036, ['#3e4147', '#4e5158', '#3a3d43', '#525559', '#474a50'], 1, 3);
-  noise(x, S, S, S * 7, ['#41454b', '#50555c', '#393d42', '#464a51'], 2, 6);
+  noise(x, S, S, S * S * 0.036, ['#494b47', '#66665e', '#42443f', '#6e6d63', '#565852'], 1, 3);
+  noise(x, S, S, S * 7, ['#50514c', '#62635b', '#464741', '#595a54'], 2, 6);
   // 大块修补色斑（v2.21.2：数量/透明度减半——远距 mip 后的"云雾斑"主源）
   for (let i = 0; i < 8; i++) {
     x.fillStyle = `rgba(${28 + Math.random() * 20 | 0},${30 + Math.random() * 20 | 0},35,0.12)`;
@@ -135,15 +132,6 @@ function paintAsphaltColor(x, S, F) {
     x.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2);
   }
   // 井盖：外圈 + 内圈盘 + 高光弧
-  for (const m of F.manholes) {
-    x.fillStyle = '#2d3136';
-    x.beginPath(); x.arc(m.x, m.y, m.r, 0, Math.PI * 2); x.fill();
-    x.fillStyle = '#363b41';
-    x.beginPath(); x.arc(m.x, m.y, m.r * 0.72, 0, Math.PI * 2); x.fill();
-    x.strokeStyle = 'rgba(255,255,255,0.10)';
-    x.lineWidth = Math.max(1, m.r * 0.14);
-    x.beginPath(); x.arc(m.x, m.y, m.r * 0.86, -2.2, -0.6); x.stroke();
-  }
   // 油渍（暗斑，粗糙度图对应更滑）
   for (const s of F.stains) {
     x.fillStyle = 'rgba(18,20,24,0.32)';
@@ -212,14 +200,6 @@ function paintAsphaltHeight(hx, S, F) {
     hx.strokeStyle = '#5f5f5f';
     hx.lineWidth = 2.5;
     hx.strokeRect(px, py, pw, ph);
-  }
-  for (const m of F.manholes) { // 井盖：外圈凹槽 + 盘面微凸
-    const mx = m.x / 2, my = m.y / 2, mr = m.r / 2;
-    hx.strokeStyle = '#585858';
-    hx.lineWidth = 4;
-    hx.beginPath(); hx.arc(mx, my, mr, 0, Math.PI * 2); hx.stroke();
-    hx.fillStyle = '#8b8b8b';
-    hx.beginPath(); hx.arc(mx, my, mr * 0.72, 0, Math.PI * 2); hx.fill();
   }
   hx.strokeStyle = '#6a6a6a'; // 裂纹微凹
   for (const pts of F.cracks) {
@@ -319,6 +299,11 @@ const STYLE_LANE = {
     wearMarkings(x, S, [[0.486, 0.024], [0.056, 0.024], [0.920, 0.024]], S * 0.005);
   },
 };
+
+export function makeJunctionTextures() {
+  if (!_roadTexCache.junction) _roadTexCache.junction = buildRoadTextures({ tracks: [], markings() {} });
+  return _roadTexCache.junction;
+}
 
 export function makeAsphaltTextures() {
   if (!_roadTexCache.street) _roadTexCache.street = buildRoadTextures(STYLE_STREET);
@@ -559,7 +544,8 @@ export function paintSky(ctx, p) {
   // sunX 未传时回落晴天方位（weather.js 混合只传颜色与 sunGlow）
   const sunX = 1024 * (p.sunX ?? SKY_SUNNY.sunX);
   if (p.sunGlow > 0.01) {
-    const sg = ctx.createRadialGradient(sunX, 96, 2, sunX, 96, 150);
+    const sunY = 512 * (p.sunY ?? 96 / 512);
+    const sg = ctx.createRadialGradient(sunX, sunY, 2, sunX, sunY, 150);
     sg.addColorStop(0, `rgba(255,246,214,${p.sunGlow})`);
     sg.addColorStop(0.3, `rgba(255,238,190,${p.sunGlow * 0.36})`);
     sg.addColorStop(1, 'rgba(255,238,190,0)');

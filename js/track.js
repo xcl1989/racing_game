@@ -1,5 +1,6 @@
 // track.js — 大地图闭环赛道：样条曲线 → 路面几何 → 起点/检查点
 import * as THREE from 'three';
+import { createRoadMaterial } from './roads.js';
 import { makeAsphaltTextures, makeDirtTextures, makeCheckerTexture } from './textures.js';
 
 export const HALF_WIDTH = 7;      // 路半宽（总宽 14m，双向车道）
@@ -57,14 +58,12 @@ export function buildTrack(scene) {
   roadGeo.setIndex(idx);
   roadGeo.computeVertexNormals();
   const asphalt = makeAsphaltTextures();
-  const road = new THREE.Mesh(roadGeo, new THREE.MeshStandardMaterial({
+  const road = new THREE.Mesh(roadGeo, createRoadMaterial('asphalt', {
     map: asphalt.map,
     normalMap: asphalt.normal,
     normalScale: new THREE.Vector2(0.75, 0.75),
     roughnessMap: asphalt.roughness,
     roughness: 0.9,          // roughnessMap 乘数
-    metalness: 0.04,
-    envMapIntensity: 0.55,   // 沥青微反射（潮湿高光感）
   }));
   road.receiveShadow = true;
   scene.add(road);
@@ -92,10 +91,10 @@ export function buildTrack(scene) {
     g.setIndex(idx2);
     g.computeVertexNormals();
     const dirt = makeDirtTextures(1);
-    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    const m = new THREE.Mesh(g, createRoadMaterial('dirt', {
       map: dirt.map, normalMap: dirt.normal,
       normalScale: new THREE.Vector2(0.9, 0.9),
-      roughness: 1, metalness: 0,
+      roughness: 1,
     }));
     m.receiveShadow = true;
     return m;
@@ -159,7 +158,7 @@ export function buildTrack(scene) {
     g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 126, 1, 126], 2));
     g.setIndex([0, 1, 2, 1, 3, 2]);
     g.computeVertexNormals();
-    const stripRoad = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    const stripRoad = new THREE.Mesh(g, createRoadMaterial('asphalt', {
       // v2.21.2 ⚠️ 必须 clone：贴图工厂已单例共享，直接改 repeat 会污染全图路面
       //（曾把世界所有路的虚线压成 9.5cm 周期的"拉链纹"——repeat 是贴图实例的可变状态）
       map: (() => {
@@ -177,12 +176,12 @@ export function buildTrack(scene) {
         r.repeat.set(1, 126);
         return r;
       })(),
-      roughness: 0.9, metalness: 0.04, envMapIntensity: 0.55,
+      roughness: 0.9,
     }));
     stripRoad.receiveShadow = true;
     scene.add(stripRoad);
     // 起/终点格子线
-    const checkMat = new THREE.MeshStandardMaterial({ map: makeCheckerTexture(), roughness: 0.6 });
+    const checkMat = createRoadMaterial('marking', { map: makeCheckerTexture(), roughness: 0.68 });
     for (const p of [A.clone(), A.clone().addScaledVector(dir, 758)]) {
       const line = new THREE.Mesh(new THREE.PlaneGeometry(strip.width, 2.4), checkMat);
       line.rotation.x = -Math.PI / 2;

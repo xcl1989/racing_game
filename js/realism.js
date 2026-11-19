@@ -9,32 +9,7 @@
 import * as THREE from 'three';
 import { WEATHER_TYPES } from './weather.js';
 import { makeGrassTextureV2, makeGrassNormal, makeMountainTexture, makeMountainNormal } from './textures.js';
-import { roadMaterials } from './world.js';
 import { enhancePropMaterial } from './materials.js';
-
-// ---- v2.21 湿路反射（3A 观感核心）----
-// 天气系统每帧给出 wet 0..1（晴 0 / 多云 0.15 / 阴 0.35 / 雨 1），本函数把世界路网
-// 材质朝"湿沥青"插值：粗糙度骤降 + 颜色压暗 + 环境反射增强（天穹 PMREM 镜面感）。
-// 从注册表快照取基准值，任意 wet 反复调用幂等，不叠加漂移。
-let _roadBase = null;
-export function setRoadWet(k) {
-  k = THREE.MathUtils.clamp(k, 0, 1);
-  if (!_roadBase && roadMaterials.length) {
-    _roadBase = roadMaterials.map((m) => ({
-      m,
-      roughness: m.roughness,
-      color: m.color.clone(),
-      envMapIntensity: m.envMapIntensity ?? 1,
-    }));
-  }
-  if (!_roadBase) return;
-  for (const b of _roadBase) {
-    b.m.roughness = THREE.MathUtils.lerp(b.roughness, 0.30, k);      // 湿面镜面
-    b.m.metalness = 0.04 + 0.06 * k;                                  // 微金属提亮反射
-    b.m.envMapIntensity = b.envMapIntensity * (1 + 1.2 * k);          // 环境反射增强
-    b.m.color.copy(b.color).multiplyScalar(1 - 0.28 * k);             // 湿沥青压暗
-  }
-}
 
 export function upgradeRealism(scene) {
   // ---- 1) 氛围：雾距拉远（只动晴天；阴/雨的近雾是氛围设计，保留）----
