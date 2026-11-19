@@ -798,7 +798,7 @@ export function buildScenery(scene, track, world, rich = true) {
         spots.push([px + ox, pz + oz], [px - ox, pz - oz]);
       }
     }
-    for (const route of [world.lakeRoad, world.northConn, world.westLake]) {
+    for (const route of [world.lakeRoad, world.westLake]) {
       const rs = route.samples;
       for (let i = 6; i < rs.length - 6; i += 16) {
         const s = rs[i];

@@ -27,7 +27,6 @@ export function buildNavGraph(world, track) {
   road(world.highway.samples);
   road(world.eastConn.samples);
   road(world.southConn.samples);
-  road(world.northConn.samples);
   road(world.lakeRoad.samples);
   road(world.roundabout.samples);
   road(world.national.samples);
@@ -56,6 +55,12 @@ export function buildNavGraph(world, track) {
       .map((t) => ({ x:st.ax+dx*t, y:0.02, z:st.az+dz*t, w:st.width }));
     addPts(id++, pts);
   }
+  const rampLinks = world.northInterchange.lanes.map((lane) => {
+    const roadId = id++;
+    addPts(roadId, lane.points.map(({ x, y, z }) => ({ x, y, z, w: 0 })), 1);
+    return { ...lane, roadId };
+  });
+  const isRamp = new Set(rampLinks.map(({ roadId }) => roadId));
   // 主赛道环道（1m 采样）+ 直线加速赛道
   road(track.samples, 1);
   {
@@ -74,22 +79,23 @@ export function buildNavGraph(world, track) {
   const px = [], py = [], pz = [], pw = [], roadOf = []; // pw: 节点所在路宽（v2.27 引导线车道偏移）
   const adj = []; // adj[i] = [{to, w}, ...]
   const edgeSet = new Set(); // 去重："min_max"
-  const link = (a, b, w) => {
-    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+  const link = (a, b, w, oneWay = false) => {
+    const key = oneWay ? `${a}>${b}` : a < b ? `${a}_${b}` : `${b}_${a}`;
     if (edgeSet.has(key)) return;
     edgeSet.add(key);
     adj[a].push({ to: b, w });
-    adj[b].push({ to: a, w });
+    if (!oneWay) adj[b].push({ to: a, w });
   };
+  const bases = [];
   for (const ch of chains) {
-    const base = px.length;
+    const base = bases[ch.roadId] = px.length;
     for (const p of ch.pts) {
       px.push(p.x); py.push(p.y); pz.push(p.z); pw.push(p.w ?? 10); roadOf.push(ch.roadId);
       adj.push([]);
     }
     for (let k = 0; k < ch.pts.length - 1; k++) {
       const d = Math.hypot(px[base + k + 1] - px[base + k], pz[base + k + 1] - pz[base + k]);
-      if (d > 0.01) link(base + k, base + k + 1, d * ch.cost);
+      if (d > 0.01) link(base + k, base + k + 1, d * ch.cost, isRamp.has(ch.roadId));
     }
     // 闭合环路：samples 的 t=0 与 t=1 位置重合但链上无边 → 环路会退化成"一条线"绕远
     const n0 = base, n1 = base + ch.pts.length - 1;
@@ -113,15 +119,33 @@ export function buildNavGraph(world, track) {
       const bucket = grid.get(key2(cx + dx, cz + dz));
       if (!bucket) continue;
       for (const j of bucket) {
-        if (j <= i || roadOf[i] === roadOf[j]) continue;
+        if (j <= i || roadOf[i] === roadOf[j] || isRamp.has(roadOf[i]) || isRamp.has(roadOf[j])) continue;
         const d = Math.hypot(px[i] - px[j], pz[i] - pz[j]);
         if (d < AUTO_LINK) link(i, j, d);
       }
     }
   }
+  // Connect only the legal ramp terminals; proximity would jump between the
+  // parallel lanes and skip the tapers. Carry the lane change forward by 32 m.
+  for (const { points, roadId, highwayIndex, entering } of rampLinks) {
+    const head = bases[roadId], tail = head + points.length - 1;
+    const h = bases[0] + highwayIndex + (entering ? 4 : -4);
+    const end = entering ? head : tail;
+    const d = (a, b) => Math.hypot(px[a] - px[b], pz[a] - pz[b]);
+    link(entering ? tail : h, entering ? h : head, d(h, entering ? tail : head), true);
+    // The street junction has several coincident chain nodes. Pick the
+    // nearest one outside the ramp; all crossing streets remain connected.
+    let city = -1;
+    for (let i = 0; i < nodeCount; i++) {
+      if (isRamp.has(roadOf[i])) continue;
+      if (d(i, end) < (city < 0 ? AUTO_LINK : d(city, end))) city = i;
+    }
+    if (city !== -1) link(entering ? city : end, entering ? end : city, d(city, end), true);
+  }
   for (const jn of JUNCTIONS) {
     const found = new Map(); // roadId → 最近节点
     for (let i = 0; i < nodeCount; i++) {
+      if (isRamp.has(roadOf[i])) continue;
       const d = Math.hypot(px[i] - jn.x, pz[i] - jn.z);
       if (d > jn.r) continue;
       const cur = found.get(roadOf[i]);
@@ -325,7 +349,7 @@ export class NavGuide {
     const offs = [];
     for (let i = 0; i < dense.length; i++) {
       const w = dense[i].w;
-      offs.push(Math.min(3.3, Math.max(0.9, w / 4)));
+      offs.push(w === 0 ? 0 : Math.min(3.3, Math.max(0.9, w / 4)));
     }
     for (let i = 0; i < offs.length; i++) { // 滑动平均（边界 clamp）
       let sum = 0, cnt = 0;

@@ -287,14 +287,13 @@ export class Game {
         const [mx, my] = this.mapFn(wx, wz);
         i === 0 ? x.moveTo(mx, my) : x.lineTo(mx, my);
       });
-      x.closePath();
       x.stroke();
     };
-    const [hwPoly, cityPoly, ctryPoly] = this.world.minimapPolylines;
+    const [hwPoly, ctryPoly, firstStreet] = this.world.minimapPolylines;
     // v2.13 道路统一灰阶（宽度分级保主次，不再五颜六色）
     drawPoly(hwPoly, 'rgba(150,155,162,0.95)', 5);   // 高速
-    drawPoly(cityPoly, 'rgba(172,176,182,0.95)', 3); // 城市
-    drawPoly(ctryPoly, 'rgba(150,155,162,0.95)', 3); // 乡道
+    drawPoly(ctryPoly, 'rgba(172,176,182,0.95)', 3); // 乡道
+    drawPoly(firstStreet, 'rgba(172,176,182,0.95)', 2); // 街道
     for (let i = 3; i < this.world.minimapPolylines.length; i++) {
       drawPoly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 2); // 街道网格
     }
@@ -345,14 +344,13 @@ export class Game {
       x.lineWidth = w * lwBoost;
       x.beginPath();
       pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
-      x.closePath();
       x.stroke();
     };
-    const [hwPoly, cityPoly, ctryPoly] = this.world.minimapPolylines;
+    const [hwPoly, ctryPoly, firstStreet] = this.world.minimapPolylines;
     // v2.13 道路统一灰阶（宽度分级保主次）
     poly(hwPoly, 'rgba(150,155,162,0.95)', 20);   // 高速
-    poly(cityPoly, 'rgba(172,176,182,0.95)', 12); // 城市
-    poly(ctryPoly, 'rgba(150,155,162,0.95)', 8);  // 乡道
+    poly(ctryPoly, 'rgba(172,176,182,0.95)', 12); // 乡道
+    poly(firstStreet, 'rgba(172,176,182,0.95)', 10); // 街道
     for (let i = 3; i < this.world.minimapPolylines.length; i++) {
       poly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 10); // 街道网格
     }
@@ -672,12 +670,12 @@ export class Game {
         const [a, b] = this.bmFn(wx, wz);
         i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
       });
-      x.closePath(); x.stroke();
+      x.stroke();
     };
     const polys = this.world.minimapPolylines;
     line(polys[0], 'rgba(176,182,192,0.95)', 9);  // 高速
-    line(polys[1], 'rgba(150,157,168,0.95)', 6);  // 城市环线
-    line(polys[2], 'rgba(176,182,192,0.95)', 6);  // 乡道
+    line(polys[1], 'rgba(150,157,168,0.95)', 6);  // 乡道
+    line(polys[2], 'rgba(132,140,152,0.9)', 4);  // 街道
     for (let i = 3; i < polys.length; i++) line(polys[i], 'rgba(132,140,152,0.9)', 4); // 街道与其余路
     x.strokeStyle = 'rgba(150,157,168,0.95)'; x.lineWidth = 7;
     x.beginPath();
@@ -806,7 +804,11 @@ export class Game {
     const full = [new THREE.Vector3(this.player.pos.x, 0, this.player.pos.z)];
     let fallback = false, hops = 0;
     if (res) {
-      for (const p of res.pts) full.push(new THREE.Vector3(p.x, p.y, p.z));
+      for (const p of res.pts) {
+        const v = new THREE.Vector3(p.x, p.y, p.z);
+        v.w = p.w;
+        full.push(v);
+      }
       hops = res.hops || 0;
     } else {
       // 目的地离任何路网节点都太远（>40m，如空地/野地深处）：直线引导兜底

@@ -1,6 +1,8 @@
 // world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线 / 国道 / 盘山公路
 import * as THREE from 'three';
 import { createRoadMaterial } from './roads.js';
+import { buildNorthInterchange } from './north-interchange.js';
+import { addShowcaseCorridor } from './route-detail.js';
 import { boxBatch } from './scene-detail.js';
 import {
   makeAsphaltTextures, makeLaneTextures, makeHighwayTextures, makeJunctionTextures,
@@ -138,7 +140,7 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
 
 // v2.33 缘石统一挂接：全部路建完后执行。与其他路面交叉的缘石条带自动剔除——
 // （每条条带中心到其他路样本的距离 < 其他路半宽+1.2m 即视为交叉，白条不再压路面）
-function attachCurbs() {
+function attachCurbs(skip = () => false) {
   if (!kerbJobs.length) return;
   const CELL = 25;
   const grid = new Map();
@@ -172,7 +174,7 @@ function attachCurbs() {
   for (const job of kerbJobs) {
     const keepIdx = [];
     job.quadCenters.forEach((c, qi) => {
-      if (nearOther(job.id, c.x, c.z)) { cut++; return; }
+      if (skip(job.id, qi) || nearOther(job.id, c.x, c.z)) { cut++; return; }
       keepIdx.push(qi);
       kept++;
     });
@@ -217,7 +219,7 @@ export function buildWorld(scene) {
       150 + Math.sin(a) * 950 + Math.cos(a * 2) * 70
     ));
   }
-  const highway = ribbon(hPts, true, 20, {}, 2); // 四车道贴图
+  const highway = ribbon(hPts, true, 20, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }, 2); // 四车道贴图
   group.add(highway.mesh);
 
   // ---- 城市街区路网（中心 1050,350）----
@@ -329,21 +331,8 @@ export function buildWorld(scene) {
     southConnPts = southPts; southConnRoad = southConn;
   }
 
-  // ---- 城市北大道（v2.13）：城市北出口 ↔ 高速东北段，补齐城市四向出口 ----
-  // 沿现有纵街延伸，避免从相邻街道之间斜接。
-  let northConnPts, northConnRoad;
-  {
-    const hp = nearestCurvePoint(highway.curve, 1250, 900, (p) => p.z > 760);
-    northConnPts = [
-      new THREE.Vector3(1170, Y_CONN, zs[4]),
-      new THREE.Vector3(1170, Y_CONN, 665),
-      new THREE.Vector3(1190, Y_CONN, 760),
-      new THREE.Vector3(hp.x, Y_CONN, hp.z - 36),
-      new THREE.Vector3(hp.x, Y_CONN, hp.z),
-    ];
-    northConnRoad = ribbon(northConnPts, false, 14, { roughness: 0.9 });
-    group.add(northConnRoad.mesh);
-  }
+  const northInterchange = buildNorthInterchange(highway, zs[4]);
+  group.add(northInterchange.group);
 
   // ---- 湖滨路：城市南出口 → 湖畔环岛（把玩家引向湖景的休闲小路）----
   // 湖心 (660,-560) r140（scenery 同步此坐标），环岛距水线 189m 不入水
@@ -369,7 +358,7 @@ export function buildWorld(scene) {
   }
   const roundabout = ribbon(roundPts, true, 8, { color: 0x9a9184, roughness: 1 });
   group.add(roundabout.mesh);
-  extraRoadPolys.push(lakeRoadPts.map((p) => [p.x, p.z]), roundPts.map((p) => [p.x, p.z]));
+  extraRoadPolys.push(lakeRoadPts.map((p) => [p.x, p.z]), [...roundPts, roundPts[0]].map((p) => [p.x, p.z]));
 
   // ---- 地标电视塔（城市东北天际线，观测舱 + 天线）----
   {
@@ -612,7 +601,7 @@ export function buildWorld(scene) {
   }
   const summitRing = ribbon(summitPts, true, 9, { roughness: 0.95, follow: 0.2 });
   group.add(summitRing.mesh);
-  extraRoadPolys.push(summitPts.map((p) => [p.x, p.z]));
+  extraRoadPolys.push([...summitPts, summitPts[0]].map((p) => [p.x, p.z]));
 
   // ---- 乡间小道：西部闭环（垂直跨河的正经桥）----
   // ⚠️ 布局原则：
@@ -658,7 +647,7 @@ export function buildWorld(scene) {
     true, 4.5, { roughness: 1, follow: 0.05, minY: -5 }, 3
   );
   group.add(trail.mesh);
-  extraRoadPolys.push(trailPts.map(([x, z]) => [x, z]));
+  extraRoadPolys.push([...trailPts, trailPts[0]].map(([x, z]) => [x, z]));
 
   // ---- 湖西环路（v2.13）：高速南段 ↔ 湖滨环岛，绕湖西形成环湖通路西半环 ----
   // ⚠️ 贴地形铺路（sampleTerrain+0.05）：南段穿过湖盆坡带外缘，固定 y 会悬空
@@ -703,7 +692,7 @@ export function buildWorld(scene) {
   }
   supports.push([-900,.76,61,80,.52,10.8]);
   for (const side of [-1,1]) {
-    const z=61+side*5.22;
+    const z=60+side*5.95;
     for (let x=-940;x<=-860;x+=4) {
       supports.push([x,1.25,z,.34,.24,.46]);
       steelwork.push([x,1.82,z,.12,1.08,.14]);
@@ -1124,10 +1113,22 @@ export function buildWorld(scene) {
     }
     return best;
   }
-  function onAnyRoad(pos) {
+  function onHighway(x, z) {
+    // Use the same straight segments as the rendered ribbon. Point distance
+    // incorrectly leaves gaps along the outer lane between samples.
+    const hs = highway.samples;
+    for (let i = 1; i < hs.length; i++) {
+      const a = hs[i - 1].pos, b = hs[i].pos;
+      if (Math.abs(x - a.x) > 20 || Math.abs(z - a.z) > 20) continue;
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / (dx * dx + dz * dz)));
+      if ((x - a.x - dx * t) ** 2 + (z - a.z - dz * t) ** 2 <= 121) return true;
+    }
+    return false;
+  }
+  function onAnyRoad(pos, skipHighway = false) {
     const x = pos.x, z = pos.z;
-    return isOnCityRoad(pos)
-      || distToRouteSamples(highway.samples, x, z) <= 11
+    return (!skipHighway && (northInterchange.contains(x, z) || onHighway(x, z))) || isOnCityRoad(pos)
       || distToRouteSamples(country.samples, x, z) <= 5.5
       || distToRouteSamples(eastConnRoad.samples, x, z) <= 8.5
       || distToRouteSamples(southConnRoad.samples, x, z) <= 8.5
@@ -1138,16 +1139,16 @@ export function buildWorld(scene) {
       || distToRouteSamples(summitRing.samples, x, z) <= 5.5
       || distToRouteSamples(trail.samples, x, z) <= 3 // 野径单车道：路缘外就是野地
       || distToRouteSamples(westLakeRoad.samples, x, z) <= 6
-      || distToRouteSamples(northConnRoad.samples, x, z) <= 8.5
       || distToRouteSamples(swLinkRoad.samples, x, z) <= 6.5;
   }
   // 路面材质查询（v2.20，越野分级用）：'dirt'=土路（乡道+野径颠簸路）/ 'pave'=铺装
   // 野地（草地）由调用方以 null 表示——isOffroad 先判"路外"再查材质
   function surfaceAt(pos) {
     const x = pos.x, z = pos.z;
+    if (northInterchange.contains(x, z) || onHighway(x, z)) return 'pave';
     if (distToRouteSamples(country.samples, x, z) <= 5.5
       || distToRouteSamples(trail.samples, x, z) <= 3) return 'dirt';
-    return onAnyRoad(pos) ? 'pave' : null;
+    return onAnyRoad(pos, true) ? 'pave' : null;
   }
   function distToRoads(x, z) {
     // 供植被/建筑生成避让：全部铺装+土路（城市街道也包含）
@@ -1163,7 +1164,7 @@ export function buildWorld(scene) {
     d = Math.min(d, distToRouteSamples(summitRing.samples, x, z));
     d = Math.min(d, distToRouteSamples(trail.samples, x, z));
     d = Math.min(d, distToRouteSamples(westLakeRoad.samples, x, z));
-    d = Math.min(d, distToRouteSamples(northConnRoad.samples, x, z));
+    d = Math.min(d, northInterchange.distance(x, z));
     d = Math.min(d, distToRouteSamples(swLinkRoad.samples, x, z));
     return d;
   }
@@ -1218,23 +1219,28 @@ export function buildWorld(scene) {
   // NPC 曲线只是街道上的行车路径；地图只绘制实际道路。
   const streetPolys = cityStreets.map((s) => [[s.ax, s.az], [s.bx, s.bz]]);
   const minimapPolylines = [
-    hPts.map((p) => [p.x, p.z]),
-    cPts.map((p) => [p.x, p.z]),
+    highway.samples.map(({pos}) => [pos.x, pos.z]),
+    [...cPts, cPts[0]].map((p) => [p.x, p.z]),
     ...streetPolys,
     ...extraRoadPolys,
     eastConnPts.map((p) => [p.x, p.z]),
     southConnPts.map((p) => [p.x, p.z]),
-    northConnPts.map((p) => [p.x, p.z]),
+    ...northInterchange.minimap,
     westLakePts.map((p) => [p.x, p.z]),
     swLinkPts.map((p) => [p.x, p.z]),
   ];
 
+  addShowcaseCorridor(group, { highway, country, westLakeRoad, bldColliders, groundSampler, onAnyRoad });
+
   // v2.33 缘石统一挂接：所有路建完后执行（交叉路口条带剔除）
-  attachCurbs();
+  // Highway kerb jobs store the +side first and the inner (-side) second.
+  const highwaySegments = highway.samples.length - 1;
+  attachCurbs((roadId, quad) => roadId === 0 && quad >= highwaySegments &&
+    northInterchange.replacesCurb(quad - highwaySegments));
 
   return {
     group, highway, cityRoute, country, cityStreets,
-    eastConn: eastConnRoad, southConn: southConnRoad, northConn: northConnRoad,
+    eastConn: eastConnRoad, southConn: southConnRoad, northInterchange,
     westLake: westLakeRoad, swLink: swLinkRoad,
     lakeRoad, roundabout, national, mountainRoad, summitRing, trail,
     sprintRoutes, bldColliders,

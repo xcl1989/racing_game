@@ -706,7 +706,8 @@ export class AICar {
       this.placeOn(env, 0);
       return;
     }
-    const target = hold ? 0 : this.baseSpeed;
+    const phase = ((this.total / env.length) % 1 + 1) % 1;
+    const target = hold ? 0 : (env.speedAt?.(phase, this.baseSpeed) ?? this.baseSpeed);
     const accel = 7, decel = 16;
     if (this.speed < target) this.speed = Math.min(target, this.speed + accel * dt);
     else this.speed = Math.max(target, this.speed - decel * dt);
