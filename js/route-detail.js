@@ -1,14 +1,14 @@
 import * as THREE from 'three';
 import { createRoadMaterial } from './roads.js';
-import { boxBatch, firCrown } from './scene-detail.js';
+import { boxBatch } from './scene-detail.js';
 
 export function addShowcaseCorridor(parent, world) {
-  const { highway, country, westLakeRoad, bldColliders, groundSampler, onAnyRoad } = world;
+  const { highway, country, bldColliders, groundSampler, onAnyRoad } = world;
   const group = new THREE.Group();
   group.name = 'showcase-corridor';
   parent.add(group);
   const facade = [], awnings = [], glass = [], rails = [], posts = [], reflectors = [];
-  const forage = [], trunks = [], pines = [];
+  const forage = [];
   const mat = (color, roughness = .86) => new THREE.MeshStandardMaterial({ color, roughness });
   const roadPoint = (s, offset) => s.pos.clone().addScaledVector(s.side, offset);
   const bankY = p => groundSampler(p.x, p.z);
@@ -98,24 +98,6 @@ export function addShowcaseCorridor(parent, world) {
     forage.push([p.x, bankY(p) + .12, p.z, 1.34, .31, .82, .9 * i]);
   }
 
-  let row = 0;
-  for (const s of westLakeRoad.samples.filter((_, i) => i % 3 === 0)) {
-    const { x, z } = s.pos;
-    if (x < 438 || x > 760 || z < -723 || z > -420) continue;
-    const inland = Math.sign(s.side.x * (x - 660) + s.side.z * (z + 560)) || 1;
-    const tree = roadPoint(s, inland * (12 + (row % 3) * 3.75));
-    const low = roadPoint(s, -inland * (8.8 + (row % 2) * 3));
-    if (bankY(tree) > -.3 && clear(tree.x, tree.z, 2.7)) {
-      const h = 5.8 + row % 4 * .84, y = bankY(tree);
-      trunks.push([tree.x, y + h * .22, tree.z, .23, h * .44, .23]);
-      pines.push([tree.x, y + h * .58, tree.z, h, h * .85, h, row * 2.4, row % 3]);
-    }
-    if (bankY(low) > -.48 && clear(low.x, low.z, 1.2)) {
-      const h = 1.35 + row % 4 * .20;
-      pines.push([low.x, bankY(low) + .47 * h, low.z, h * 1.7, h, h * 1.35, row * 1.7, 3]);
-    }
-    row++;
-  }
   boxBatch(group, 'corridor-shop-reveals', mat(0x413a32), facade);
   boxBatch(group, 'corridor-shop-glazing', mat(0x476575, .39), glass);
   boxBatch(group, 'corridor-shop-canopies', mat(0x813f31, .71), awnings);
@@ -123,17 +105,4 @@ export function addShowcaseCorridor(parent, world) {
   boxBatch(group, 'corridor-roadside-posts', mat(0x626a64), posts);
   boxBatch(group, 'corridor-reflectors', new THREE.MeshStandardMaterial({ color: 0xd7bb84, emissive: 0x685021, emissiveIntensity: .23 }), reflectors);
   boxBatch(group, 'corridor-bank-stones', mat(0x777064), forage);
-  boxBatch(group, 'corridor-trees-trunks', mat(0x53422d), trunks);
-  if (pines.length) {
-    const mesh = new THREE.InstancedMesh(firCrown(), new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }), pines.length);
-    mesh.name = 'corridor-lake-vegetation';
-    const pose = new THREE.Object3D();
-    const colors = [0x365746, 0x3a604a, 0x506b42, 0x687a42];
-    pines.forEach(([x, y, z, sx, sy, sz, yaw, tint], i) => {
-      pose.position.set(x, y, z); pose.scale.set(sx * .43, sy, sz * .43); pose.rotation.y = yaw; pose.updateMatrix();
-      mesh.setMatrixAt(i, pose.matrix); mesh.setColorAt(i, c.setHex(colors[tint]));
-    });
-    mesh.receiveShadow = true;
-    group.add(mesh);
-  }
 }

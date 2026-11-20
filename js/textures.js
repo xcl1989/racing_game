@@ -414,27 +414,46 @@ export function makeDirtTextures(repeat = 1) {
   return _roadTexCache['dirt' + repeat];
 }
 
-// ---- 云朵（多个柔边白团叠加，加底部阴影更有体积感）----
+// A soft silhouette with a cool, relatively flat underside. Generated once at boot.
 export function makeCloudTexture() {
-  const [c, x] = makeCanvas(256, 128);
-  x.clearRect(0, 0, 256, 128);
-  const puff = (cx, cy, r, a, tint = '255,255,255') => {
-    const g = x.createRadialGradient(cx, cy, 1, cx, cy, r);
-    g.addColorStop(0, `rgba(${tint},${a})`);
-    g.addColorStop(1, `rgba(${tint},0)`);
-    x.fillStyle = g;
-    x.fillRect(cx - r, cy - r, r * 2, r * 2);
+  const w = 256, h = 128;
+  const [c, ctx] = makeCanvas(w, h);
+  const image = ctx.createImageData(w, h);
+  const smooth = THREE.MathUtils.smoothstep;
+  const lobes = [[.28,.57,.20,.23], [.43,.44,.20,.31], [.57,.49,.23,.26],
+                 [.72,.56,.20,.23], [.55,.64,.36,.17]];
+  const grid = (x, y) => {
+    let n = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    return ((n ^ (n >>> 16)) >>> 0) / 4294967295;
   };
-  // 底部淡灰（云底阴影）
-  puff(120, 92, 58, 0.5, '205,212,225');
-  puff(160, 90, 46, 0.42, '205,212,225');
-  // 主体白团
-  puff(128, 70, 62, 0.88);
-  puff(85, 78, 45, 0.72);
-  puff(172, 76, 48, 0.72);
-  puff(105, 60, 40, 0.62);
-  puff(150, 60, 38, 0.58);
-  puff(112, 50, 30, 0.5);
+  const grain = (x, y, size) => {
+    x /= size; y /= size;
+    const ix = Math.floor(x), iy = Math.floor(y);
+    const sx = smooth(x - ix, 0, 1), sy = smooth(y - iy, 0, 1);
+    const lerp = THREE.MathUtils.lerp;
+    return lerp(lerp(grid(ix, iy), grid(ix+1, iy), sx),
+                lerp(grid(ix, iy+1), grid(ix+1, iy+1), sx), sy);
+  };
+  for (let y = 0, i = 0; y < h; y++) {
+    for (let x = 0; x < w; x++, i += 4) {
+      const u = x / w, v = y / h;
+      const broad = grain(x, y, 23);
+      const detail = .70 * broad + .23 * grain(x+71, y+21, 9) + .07 * grain(x-44, y, 3);
+      let mass = 0;
+      for (const [cx, cy, rx, ry] of lobes) {
+        const r2 = ((u-cx)/rx)**2 + ((v-cy)/ry)**2;
+        mass = Math.max(mass, 1-r2);
+      }
+      const density = smooth(mass + .9 * (detail-.5), .12, .82);
+      const underside = smooth(v + .16 * (broad-.5), .42, .79);
+      image.data[i] = 255 - 92 * underside;
+      image.data[i+1] = 252 - 73 * underside;
+      image.data[i+2] = 244 - 45 * underside;
+      image.data[i+3] = 255 * density;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -516,10 +535,10 @@ export function makeWindowsTexture() {
   return finish(c);
 }
 
-// ---- 天穹 equirect 渐变（背景 + 环境反射共用）----
+// ---- 可见天穹 equirect 渐变（反射单独烘焙，共用天气色板）----
 // 参数化绘制：天气系统按同一套 stop 动态重绘（晴/多云/阴/雨共用此函数）
 export const SKY_SUNNY = {
-  zenith: '#1d4da8', mid: '#4a8ccc', horizon: '#dcebf6',
+  zenith: '#245387', mid: '#578fbc', horizon: '#d4e3e8',
   g1: '#9db3a4', g2: '#54685a', g3: '#3a4a40',
   sunX: 0.605, sunGlow: 0.7, // 与原版一致：0.5 + 0.66/(2π)（太阳 sprite 在东南高空）
 };
@@ -528,8 +547,8 @@ export function paintSky(ctx, p) {
   // 垂直渐变：天顶 → 地平线（保持足够饱和度防过曝发白）
   const g = ctx.createLinearGradient(0, 0, 0, 256);
   g.addColorStop(0, p.zenith);
-  g.addColorStop(0.45, p.mid);
-  g.addColorStop(0.8, p.horizon);
+  g.addColorStop(0.58, p.mid);
+  g.addColorStop(0.95, p.horizon);
   g.addColorStop(1, p.horizon);
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, 1024, 256);
@@ -554,7 +573,7 @@ export function paintSky(ctx, p) {
   }
 }
 
-// 可重绘天穹：weather.js 在天气过渡时反复 repaint（背景与 PMREM 环境共用同一张 tex）
+// 可重绘天穹：天气过渡时更新背景贴图。
 export function createSkyPainter() {
   const [c, ctx] = makeCanvas(1024, 512);
   paintSky(ctx, SKY_SUNNY);

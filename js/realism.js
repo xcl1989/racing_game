@@ -1,29 +1,15 @@
 // realism.js — 环境材质真实化（v2.15 建立，v2.29 扩展道具微表面）
 // 设计原则：不改动 scenery.js / world.js 的生成代码（避免与并行会话撞车），
 // 在世界构建完成后对场景做一次"材质升级遍历"：
-//   1. 氛围：晴天雾距拉远（并同步 WEATHER_TYPES preset，防天气过渡打回原样）
-//   2. 地面：草地贴图换 V2（有机软斑，去平铺马赛克方块感）+ 草丛法线 + 压环境反射
-//   3. 远山：白金字塔 → 顶点色渐变山体（山脚深绿灰→山顶雾蓝）+ 实例色压暗 + 前移
-//      （原山在 2350-2600 处被 2700 雾距泡掉 ~90% = 纯白三角）
-//   4. v2.29 道具微表面：全场景"纯色无贴图"材质注入细节法线+粗糙度图（materials.js）
+//   1. 地面：草地贴图换 V2（有机软斑，去平铺马赛克方块感）+ 草丛法线 + 压环境反射
+//   2. 远山：重塑装饰山脊的轮廓和岩草色过渡，不改可驾地形。
+//   3. v2.29 道具微表面：全场景"纯色无贴图"材质注入细节法线+粗糙度图（materials.js）
 import * as THREE from 'three';
-import { WEATHER_TYPES } from './weather.js';
 import { makeGrassTextureV2, makeGrassNormal, makeMountainTexture, makeMountainNormal } from './textures.js';
 import { enhancePropMaterial } from './materials.js';
 
 export function upgradeRealism(scene) {
-  // ---- 1) 氛围：雾距拉远（只动晴天；阴/雨的近雾是氛围设计，保留）----
-  if (scene.fog) {
-    scene.fog.near = 420;
-    scene.fog.far = 3800;
-  }
-  const sunny = WEATHER_TYPES && WEATHER_TYPES.sunny;
-  if (sunny) {
-    sunny.fogNear = 420;
-    sunny.fogFar = 3800;
-  }
-
-  // ---- 2) 地面材质升级（识别：5200 PlaneGeometry 位移网格）----
+  // ---- 地面材质升级（识别：5200 PlaneGeometry 位移网格）----
   const mtx = new THREE.Matrix4();
   const pv = new THREE.Vector3(), qv = new THREE.Quaternion(), sv = new THREE.Vector3();
   let groundDone = false, mountainDone = false, propCount = 0;
@@ -87,60 +73,36 @@ export function upgradeRealism(scene) {
     // 远山：ConeGeometry(1,1,5) 实例群
     if (!mountainDone && o.isInstancedMesh && geo.type === 'ConeGeometry'
         && geo.parameters.radialSegments === 5 && o.count > 20) {
-      // v2.24 山体重制：14 段锥 + 方位角翘曲（v2.15）+ 三频 crag 噪声径向皱缩（新）
-      //   + 岩壁层理贴图/法线（新）+ 海拔顶色带与噪声雪线（新）——根治"光滑渐变帐篷"
-      const newGeo = new THREE.ConeGeometry(1, 1, 14, 12); // 高度段 8→12：皱缩需要纵向分辨率
-      // 确定性伪噪声（同一几何所有实例共享，随机 rotation.y 提供个体差异）
-      const crag = (a, h, s) =>
-        Math.sin(a * 2.7 + s) * Math.sin(h * 3.1 + a * 1.4 + s * 0.7)
-        + 0.5 * Math.sin(a * 5.3 - h * 2.2 + s * 1.3)
-        + 0.25 * Math.sin(a * 9.7 + h * 5.9 - s * 0.5);
-      {
-        const pp = newGeo.attributes.position;
-        for (let i = 0; i < pp.count; i++) {
-          const vx = pp.getX(i), vy = pp.getY(i), vz = pp.getZ(i);
-          const rr = Math.hypot(vx, vz);
-          if (rr > 0.01) { // 锥尖不动
-            const a = Math.atan2(vz, vx);
-            // 径向扰动：打破底盘的圆对称
-            const k = 1 + 0.22 * Math.sin(a * 2.1 + 1.7)
-              + 0.15 * Math.sin(a * 4.3 + 0.6)
-              + 0.09 * Math.sin(a * 7.7 + 2.9);
-            // crag 皱缩：山脊锯齿（基座全量、山尖渐隐），世界尺度 = 局部幅度 × 实例宽（~600m×0.075≈45m）
-            const h01 = vy + 0.5;
-            const fade = Math.min(1, h01 * 4) * (1 - THREE.MathUtils.smoothstep(h01, 0.85, 1));
-            const cr = crag(a * 2.0 + 3.0, h01 * 4.0, 1.0) * 0.075 * fade;
-            pp.setX(i, vx * k * (1 + cr));
-            pp.setZ(i, vz * k * (1 + cr));
-            // 剖面翘曲：按方位角改变坡面鼓包——直线三角剖面变起伏山脊
-            const warp = 1 + 0.24 * Math.sin(a * 2.3 + 0.9)
-              + 0.15 * Math.sin(a * 5.1 + 2.2)
-              + crag(a * 1.6, h01 * 3.2, 4.2) * 0.06 * fade; // 纵向也带噪声 → 坡面起伏
-            pp.setY(i, h01 * warp - 0.5);
-          }
-        }
-        newGeo.computeVertexNormals();
-      }
-      // 顶点色：山脚灰绿（接草地）→ 山腰岩灰 → 山顶雾蓝霭 + 噪声雪线（只给高海拔）
-      // ⚠️ 注意三层相乘：实例色 × 顶点色 × 岩贴图——这里必须保持高亮度（v2.24 黑墙教训）
+      // Deform the decorative range only; the driveable heightfield is untouched.
+      const newGeo = new THREE.ConeGeometry(1, 1, 24, 14);
       const pos = newGeo.attributes.position;
-      const n = pos.count;
-      const cols = new Float32Array(n * 3);
-      const cBot = new THREE.Color(0x5f6f60);
-      const cMid = new THREE.Color(0x93a196);
-      const cTop = new THREE.Color(0xc4d0d8);
-      const cSnow = new THREE.Color(0xe6ecf1);
-      const tmp = new THREE.Color();
-      for (let i = 0; i < n; i++) {
-        const t = THREE.MathUtils.clamp(pos.getY(i) + 0.5, 0, 1);
-        if (t < 0.45) tmp.copy(cBot).lerp(cMid, t / 0.45);
-        else tmp.copy(cMid).lerp(cTop, (t - 0.45) / 0.55);
-        // 雪线：t>0.68 起按噪声边界过渡（0.3 抖动 → 锯齿状雪缘）
-        const a = Math.atan2(pos.getZ(i), pos.getX(i));
-        const sn = crag(a * 2.4, t * 3.1, 7.7);
-        const snowT = THREE.MathUtils.clamp((t - 0.68) * 6 + sn * 0.3, 0, 1);
-        tmp.lerp(cSnow, snowT * 0.9);
-        cols[i * 3] = tmp.r; cols[i * 3 + 1] = tmp.g; cols[i * 3 + 2] = tmp.b;
+      const cols = new Float32Array(pos.count * 3);
+      const smooth = THREE.MathUtils.smoothstep;
+      const grass = new THREE.Color(0x889387), rock = new THREE.Color(0xa1a9a6);
+      const tint = new THREE.Color();
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), z = pos.getZ(i), t = pos.getY(i) + .5;
+        const a = Math.atan2(z, x);
+        const ridge = .62 * Math.sin(3*a + t*1.8) + .27 * Math.sin(5*a - t*4.2) + .11 * Math.sin(9*a + t*7.1);
+        const shape = (1 + .26*Math.cos(2*a-.8) + .13*ridge) * (1 + .44*t);
+        const shoulder = Math.sin(Math.PI*t) * (.105*ridge + .08*Math.sin(2*a-1.3));
+        const height = t * t * (3 - 2*t) + shoulder;
+        pos.setXYZ(i, x*shape + .22*t*t, height - .5, z*shape - .09*t*t);
+        tint.copy(grass).lerp(rock, smooth(height + ridge*.18, .23, .93));
+        tint.multiplyScalar(1 + ridge*.11);
+        tint.toArray(cols, i*3);
+      }
+      newGeo.computeVertexNormals();
+      // Cone side normals at the UV seam need the same lighting on both copies.
+      const normals = newGeo.attributes.normal;
+      for (let row = 0; row <= 14; row++) {
+        const left = row*25, right = left+24;
+        const x = normals.getX(left) + normals.getX(right);
+        const y = normals.getY(left) + normals.getY(right);
+        const z = normals.getZ(left) + normals.getZ(right);
+        const len = Math.hypot(x, y, z) || 1;
+        normals.setXYZ(left, x/len, y/len, z/len);
+        normals.setXYZ(right, x/len, y/len, z/len);
       }
       newGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
       o.geometry = newGeo;
@@ -163,19 +125,21 @@ export function upgradeRealism(scene) {
         o.setColorAt(i, col);
       }
       if (o.instanceColor) o.instanceColor.needsUpdate = true;
-      // 前移 + 压低：雾浓度从 ~90% 降到 ~45%，山体现出渐变层次
+      // Broader, lower shoulders connect the range instead of isolated cones.
       for (let i = 0; i < o.count; i++) {
         o.getMatrixAt(i, mtx);
         mtx.decompose(pv, qv, sv);
         const pull = Math.hypot(pv.x, pv.z) > 1800 ? 0.78 : 0.9;
         pv.x *= pull; pv.z *= pull;
-        sv.y *= 0.85;
-        sv.z *= 0.82 + Math.random() * 0.25; // 纵深不等轴：剪影不再左右对称
+        sv.x *= 1.16;
+        sv.y *= 0.67 + 0.10 * Math.sin(i * 1.73);
+        sv.z *= 0.88 + Math.random() * 0.25; // 纵深不等轴：剪影不再左右对称
         pv.y = sv.y / 2 - 5;
         mtx.compose(pv, qv, sv);
         o.setMatrixAt(i, mtx);
       }
       o.instanceMatrix.needsUpdate = true;
+      o.computeBoundingSphere();
       mountainDone = true;
     }
   });

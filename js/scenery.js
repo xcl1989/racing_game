@@ -5,6 +5,7 @@ import {
   makeGrassTexture, makeWaterNormal, makeTuftTexture,
   makeBillboardTexture, makeBirdTexture, makeFieldTexture,
 } from './textures.js';
+import { addMirrorLakePlanting, ageMirrorLakePaint, shadeMirrorLake } from './lake-detail.js';
 import { firCrown } from './scene-detail.js';
 import { LAKE } from './world-guide.js';
 import { HALF_WIDTH } from './track.js';
@@ -82,7 +83,9 @@ export function buildScenery(scene, track, world, rich = true) {
     roughness: 1, metalness: 0,
   }));
   ground.receiveShadow = true;
+  shadeMirrorLake(ground.material, world.westLake);
   scene.add(ground);
+  ageMirrorLakePaint(world.westLake.mesh.material);
 
   // ---- 湖（盆地下切后的水面：低于地面 1.5m，盆缘 136-146 收紧成陡岸）----
   // 新位置 (660,-560)；world.js 湖滨路环岛与湖东野径按此坐标衔接（野径 d≥145 贴岸顶）
@@ -328,6 +331,7 @@ export function buildScenery(scene, track, world, rich = true) {
   }
   const leafGeo = lumpyLeaf();
   const foliageTex = makeFoliageTexture();
+  addMirrorLakePlanting(scene, world, rich, foliageTex);
   const trunkGeo = new THREE.CylinderGeometry(0.13, 0.27, 2.6, 7, 3);
   const barkPos = trunkGeo.attributes.position;
   for (let i = 0; i < barkPos.count; i++) {
@@ -799,14 +803,12 @@ export function buildScenery(scene, track, world, rich = true) {
         spots.push([px + ox, pz + oz], [px - ox, pz - oz]);
       }
     }
-    for (const route of [world.lakeRoad, world.westLake]) {
-      const rs = route.samples;
-      for (let i = 6; i < rs.length - 6; i += 16) {
-        const s = rs[i];
-        for (const sign of [1, -1]) {
-          const p = s.pos.clone().addScaledVector(s.side, sign * (route === world.westLake ? 6.5 : 7.5));
-          spots.push([p.x, p.z]);
-        }
+    const lakeApproach = world.lakeRoad.samples;
+    for (let i = 6; i < lakeApproach.length - 6; i += 16) {
+      const s = lakeApproach[i];
+      for (const sign of [1, -1]) {
+        const p = s.pos.clone().addScaledVector(s.side, sign * 7.5);
+        spots.push([p.x, p.z]);
       }
     }
     const N_ST = spots.length;

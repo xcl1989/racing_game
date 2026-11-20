@@ -17,36 +17,36 @@ const C = (hex) => new THREE.Color(hex);
 export const WEATHER_TYPES = {
   sunny: {
     label: '晴',
-    sky: { zenith: '#1d4da8', mid: '#3f86cc', horizon: '#e2edf4', g1: '#9db3a4', g2: '#54685a', g3: '#3a4a40', sunGlow: 0.7 },
+    sky: { zenith: '#245387', mid: '#578fbc', horizon: '#d4e3e8', g1: '#9db3a4', g2: '#54685a', g3: '#3a4a40', sunGlow: 0.7 },
     // v2.13 Forza 级晴天观感：黄金时刻更亮更饱（太阳/曝光/半球同步抬）
     // v2.22：太阳再暖再强一档 + 环境对比加深（阴影更有戏，直射面更金）
     sunI: 1.95, sunColor: 0xffe7c7, hemiI: 0.48, hemiSky: 0xbfd9ff, hemiGnd: 0x556a40,
-    fogColor: 0xd7e9f5, fogNear: 340, fogFar: 2700, exp: 1.04,
+    fogColor: 0xc2d4df, fogNear: 320, fogFar: 2700, exp: 1.04,
     cloudMul: 1.0, cloudTint: 0xffffff, sunSprite: 1.0,
     rain: 0, wet: 0,
   },
   cloudy: {
     label: '多云',
-    sky: { zenith: '#3d6da8', mid: '#6d97c4', horizon: '#c2d3dd', g1: '#8fa094', g2: '#4e5e52', g3: '#38443e', sunGlow: 0.3 },
+    sky: { zenith: '#3f6389', mid: '#7094ae', horizon: '#c8d5dd', g1: '#8fa094', g2: '#4e5e52', g3: '#38443e', sunGlow: 0.3 },
     sunI: 1.25, sunColor: 0xfff0d8, hemiI: 0.68, hemiSky: 0xc4d4e4, hemiGnd: 0x54604c,
-    fogColor: 0xc4d2da, fogNear: 280, fogFar: 2100, exp: 0.94,
-    cloudMul: 1.7, cloudTint: 0xf0f2f5, sunSprite: 0.35,
+    fogColor: 0xb9c9d3, fogNear: 240, fogFar: 1850, exp: 0.94,
+    cloudMul: 1.35, cloudTint: 0xf0f2f5, sunSprite: 0.35,
     rain: 0, wet: 0.15,
   },
   overcast: {
     label: '阴',
-    sky: { zenith: '#4a5562', mid: '#6a7480', horizon: '#a4adb4', g1: '#7a8078', g2: '#444c46', g3: '#333a36', sunGlow: 0.06 },
+    sky: { zenith: '#465460', mid: '#74808b', horizon: '#adb9bf', g1: '#7a8078', g2: '#444c46', g3: '#333a36', sunGlow: 0.06 },
     sunI: 0.6, sunColor: 0xcdd5e0, hemiI: 0.8, hemiSky: 0xaeb8c2, hemiGnd: 0x4c524c,
-    fogColor: 0x9aa4ac, fogNear: 190, fogFar: 1250, exp: 0.84,
-    cloudMul: 2.4, cloudTint: 0xc8ccd2, sunSprite: 0.06,
+    fogColor: 0x9eacb5, fogNear: 190, fogFar: 1250, exp: 0.84,
+    cloudMul: 1.55, cloudTint: 0xc8ccd2, sunSprite: 0.06,
     rain: 0, wet: 0.35,
   },
   rain: {
     label: '雨',
-    sky: { zenith: '#39424c', mid: '#55606a', horizon: '#828b93', g1: '#666c66', g2: '#3c423e', g3: '#2e3431', sunGlow: 0 },
+    sky: { zenith: '#303c49', mid: '#566575', horizon: '#9baab2', g1: '#666c66', g2: '#3c423e', g3: '#2e3431', sunGlow: 0 },
     sunI: 0.35, sunColor: 0xb8c2cc, hemiI: 0.85, hemiSky: 0x9aa6b2, hemiGnd: 0x424a44,
-    fogColor: 0x7f8890, fogNear: 130, fogFar: 850, exp: 0.87,
-    cloudMul: 2.9, cloudTint: 0xaab0b8, sunSprite: 0,
+    fogColor: 0x899aa6, fogNear: 130, fogFar: 850, exp: 0.87,
+    cloudMul: 1.45, cloudTint: 0xaab0b8, sunSprite: 0,
     rain: 1, wet: 1,
   },
 };
@@ -92,7 +92,7 @@ const hex = (c) => `#${c.getHexString()}`;
 
 export function createWeather({
   scene, painter, bakeEnvironment, hemi, sun, sunSprite, clouds,
-  fog, rain, audio, onNotice,
+  rain, audio, onNotice,
 }) {
   let cur = 'sunny';
   let next = null;
@@ -115,6 +115,7 @@ export function createWeather({
     scene.environment = bakeEnvironment(p);
   }
   refreshSky(startP);
+  const fog = scene.fog;
 
   const weather = {
     exposure: startP.exp,

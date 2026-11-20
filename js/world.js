@@ -656,7 +656,7 @@ export function buildWorld(scene) {
     // v2.33 末点伸进环岛圈带（r16~24）：旧端点 (800,-392) 距环岛中心 34m，断在草地上
     westLakePts = raw.map(([x, z]) => new THREE.Vector3(x, Math.max(0.02, sampleTerrain(x, z) + 0.05), z));
     westLakePts[0].y = hp.y + 0.03; // 端点略抬，压高速防共面
-    westLakeRoad = ribbon(westLakePts, false, 9, { color: 0x9a9184, roughness: 1, follow: 0.05, minY: 0.02 });
+    westLakeRoad = ribbon(westLakePts, false, 9, { color: 0x9a9184, roughness: 1, follow: 0.05, minY: 0.02, curb: false });
     group.add(westLakeRoad.mesh);
   }
 
@@ -1223,7 +1223,7 @@ export function buildWorld(scene) {
   addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 &&
     !bldColliders.some(b => Math.abs(x - b.x) < b.hw + .8 && Math.abs(z - b.z) < b.hd + .8));
 
-  addShowcaseCorridor(group, { highway, country, westLakeRoad, bldColliders, groundSampler, onAnyRoad });
+  addShowcaseCorridor(group, { highway, country, bldColliders, groundSampler, onAnyRoad });
 
   // v2.33 缘石统一挂接：所有路建完后执行（交叉路口条带剔除）
   // Highway kerb jobs store the +side first and the inner (-side) second.

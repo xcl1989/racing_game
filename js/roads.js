@@ -2,7 +2,7 @@ import * as THREE from 'three';
 
 // All four surfaces are dielectrics. Only asphalt develops a smooth water film.
 const profiles = {
-  asphalt: { darken: 0.24, wetRough: 0.22, env: 0.56, wetEnv: 1.38, variation: 0.15, edges: 1 },
+  asphalt: { darken: 0.20, wetRough: 0.48, env: 0.56, wetEnv: 0.77, variation: 0.15, edges: 1 },
   dirt: { darken: 0.44, wetRough: 0.77, env: 0.27, wetEnv: 0.29, variation: 0.22, edges: 0 },
   concrete: { darken: 0.24, wetRough: 0.68, env: 0.36, wetEnv: 0.44, variation: 0.16, edges: 0 },
   marking: { darken: 0.09, wetRough: 0.54, env: 0.48, wetEnv: 0.56, variation: 0.03, edges: 0 },
@@ -52,7 +52,7 @@ export function createRoadMaterial(kind, options) {
   // layer independently of texture UVs so existing lane dimensions stay fixed.
   const material = new THREE.MeshStandardMaterial({ roughness: 0.92, ...options, metalness: 0, envMapIntensity: p.env });
   material.userData.roadSurface = kind;
-  material.customProgramCacheKey = () => `road-surface-v2:${kind}`;
+  material.customProgramCacheKey = () => `road-surface-v3:${kind}`;
   const f = (n) => n.toFixed(3);
   material.onBeforeCompile = (shader) => {
     shader.uniforms.roadWetness = roadWetness;
@@ -81,7 +81,9 @@ export function createRoadMaterial(kind, options) {
           roadEdge = smoothstep(0.43, 0.50, abs(vMapUv.x - 0.5)) * ${f(p.edges)};
         #endif` : ''}
         float roadDose = roadWetness * mix(0.40, 1.0, smoothstep(0.22, 0.76, roadPattern.r));
-        float roadFilm = roadWetness * smoothstep(0.31, 0.69, roadPattern.r * 0.68 + roadPattern.g * 0.32);
+        float roadFilm = roadWetness * ${kind === 'asphalt'
+          ? 'mix(0.32, 0.84, smoothstep(0.19, 0.81, dot(roadPattern, vec3(0.51, 0.33, 0.16))))'
+          : 'smoothstep(0.31, 0.69, roadPattern.r * 0.68 + roadPattern.g * 0.32)'};
         float roadVariation = (dot(roadPattern, vec3(0.54, 0.32, 0.14)) - 0.5) * 2.0;
         diffuseColor.rgb *= 1.0 + roadVariation * ${f(p.variation)} * (1.0 - 0.85 * roadPaint);
         diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.10, 1.01, 0.88), roadEdge * (1.0 - roadPaint) * (1.0 - roadWetness * 0.65));

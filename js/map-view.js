@@ -2,14 +2,15 @@ import { LAKE, FOOTHILL_LAKE, RIVER } from './world-guide.js';
 
 const S = 1024;
 const TAU = Math.PI * 2;
+// [minimap color, close width, atlas color, atlas width, optional dash]
 const STYLES = {
-  dirt: ['#bca487', 1.55, 3.1, [3.6, 3]],
-  local: ['#97abb0', 1.65, 3.1],
-  circuit: ['#d4b59f', 2.1, 4.3],
-  arterial: ['#c9d2ce', 2.5, 4.8],
-  highway: ['#e2c17d', 3.6, 6.7],
-  ramps: ['#e2c17d', 1.8, 3.6],
-  bridge: ['#ebd5b1', 2.2, 4.8],
+  dirt: ['#bca487', 1.55, '#92866c', 1.85, [3.6, 3]],
+  local: ['#97abb0', 1.65, '#c4c9b6', 2.65],
+  circuit: ['#d4b59f', 2.1, '#c1a797', 3.5],
+  arterial: ['#c9d2ce', 2.5, '#ebe4cb', 3.6],
+  highway: ['#e2c17d', 3.6, '#e4bb74', 5.25],
+  ramps: ['#e2c17d', 1.8, '#d3b079', 2.4],
+  bridge: ['#ebd5b1', 2.2, '#e4d0a5', 3.1],
 };
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -80,8 +81,7 @@ export class MapView {
     const [minX, maxX, minZ, maxZ] = this.rect;
     this.cx = (minX + maxX) * .5; this.cz = (minZ + maxZ) * .5;
     this.scale = (S - 80) / Math.max(maxX - minX, maxZ - minZ);
-    this.start = track.startPos;
-    this.buildBase();
+    this.buildBase(world);
   }
 
   // Match the in-game camera: facing +Z, world +X is screen-left.
@@ -90,54 +90,69 @@ export class MapView {
 
   terrainAndRoads(ctx, scale, full, far = false) {
     const { terrain, roads } = this;
-    ctx.fillStyle = '#253438'; ctx.fill(terrain.city);
-    for (const [i, contour] of terrain.contours.entries()) {
-      ctx.fillStyle = i % 2 ? '#263e38' : '#213832';
-      ctx.fill(contour); ctx.strokeStyle = '#476057'; ctx.lineWidth = .75 / scale; ctx.stroke(contour);
+    if (!full) {
+      ctx.fillStyle = '#253438'; ctx.fill(terrain.city);
+      ctx.strokeStyle = '#476057'; ctx.lineWidth = .75 / scale;
+      for (const [i, contour] of terrain.contours.entries()) {
+        ctx.fillStyle = i % 2 ? '#263e38' : '#213832';
+        ctx.fill(contour); ctx.stroke(contour);
+      }
     }
     for (const water of terrain.water) {
-      ctx.fillStyle = '#143d50'; ctx.fill(water);
-      ctx.strokeStyle = '#397480'; ctx.lineWidth = (full ? 1.6 : .75) / scale; ctx.stroke(water);
+      ctx.fillStyle = full ? '#254d59' : '#143d50'; ctx.fill(water);
+      ctx.strokeStyle = full ? '#618384' : '#397480'; ctx.lineWidth = (full ? 1.35 : .75) / scale; ctx.stroke(water);
     }
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (const [id, [color, miniWidth, bigWidth, dash]] of Object.entries(STYLES)) {
+    for (const [id, [miniColor, miniWidth, bigColor, bigWidth, dash]] of Object.entries(STYLES)) {
       const w = full ? bigWidth : miniWidth * (far ? .72 : 1);
       if (!dash) {
-        ctx.strokeStyle = '#101c24'; ctx.lineWidth = (w + (full ? 2.8 : 1.25)) / scale;
+        ctx.strokeStyle = full ? '#29332d' : '#101c24'; ctx.lineWidth = (w + (full ? 1.5 : 1.25)) / scale;
         ctx.stroke(roads[id]);
       } else ctx.setLineDash(dash.map(n => n * (full ? 1.9 : 1) / scale));
-      ctx.strokeStyle = color; ctx.lineWidth = w / scale; ctx.stroke(roads[id]);
+      ctx.strokeStyle = full ? bigColor : miniColor; ctx.lineWidth = w / scale; ctx.stroke(roads[id]);
       if (dash) ctx.setLineDash([]);
     }
   }
 
-  buildBase() {
+  drawRelief(ctx, sampleTerrain) {
+    // Bake once from the drivable heightfield. The broad color variation is decorative only.
+    const n = 256, step = S / n / this.scale;
+    const tile = document.createElement('canvas');
+    tile.width = tile.height = n;
+    const tc = tile.getContext('2d'), image = tc.createImageData(n, n);
+    for (let row = 0, i = 0; row < n; row++) for (let col = 0; col < n; col++, i += 4) {
+      const [x, z] = this.unproject((col + .5) * S / n, (row + .5) * S / n);
+      const h = sampleTerrain(x, z);
+      const dx = sampleTerrain(x + step, z) - sampleTerrain(x - step, z);
+      const dz = sampleTerrain(x, z + step) - sampleTerrain(x, z - step);
+      const relief = clamp(-(dx * .7 + dz) * 3.1, -24, 23);
+      const grain = Math.sin(x * .062 + Math.sin(z * .085)) * Math.sin(z * .067) * 1.3;
+      const fields = Math.sin(x * .003 + Math.cos(z * .002)) * 3 + Math.cos(z * .0038 - x * .002) * 4;
+      const light = 6 * Math.max(0, h) / 72 + relief + fields + grain;
+      image.data[i] = 56 + light; image.data[i+1] = 69 + light;
+      image.data[i+2] = 56 + light * .7; image.data[i+3] = 255;
+    }
+    tc.putImageData(image, 0, 0);
+    ctx.drawImage(tile, 0, 0, S, S);
+  }
+
+  buildBase(world) {
     const ctx = this.base.getContext('2d');
-    const bg = ctx.createLinearGradient(0, 0, 0, S);
-    bg.addColorStop(0, '#1c302f'); bg.addColorStop(1, '#172827');
-    ctx.fillStyle = bg; ctx.fillRect(0, 0, S, S);
+    this.drawRelief(ctx, world.groundSampler);
     ctx.save();
     ctx.translate(S / 2, S / 2); ctx.scale(-this.scale, -this.scale); ctx.translate(-this.cx, -this.cz);
+    ctx.fillStyle = '#a9a89b73';
+    for (const { x, z, hw, hd } of world.bldColliders) ctx.fillRect(x - hw, z - hd, 2 * hw, 2 * hd);
     this.terrainAndRoads(ctx, this.scale, true);
     ctx.restore();
-    ctx.strokeStyle = '#bddbc81f'; ctx.lineWidth = 1;
-    ctx.beginPath();
-    const [minX, maxX, minZ, maxZ] = this.rect;
-    for (let i = -1500; i <= 1500; i += 500) {
-      const [x, y] = this.project(i, i);
-      ctx.moveTo(x, this.project(0, maxZ)[1]); ctx.lineTo(x, this.project(0, minZ)[1]);
-      ctx.moveTo(this.project(minX, 0)[0], y); ctx.lineTo(this.project(maxX, 0)[0], y);
-    }
-    ctx.stroke();
-    const [sx, sy] = this.project(this.start.x, this.start.z);
-    marker(ctx, sx, sy, '#f9ce6d', 5, true);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = '600 32px "Songti SC", "Noto Serif CJK SC", serif';
+    ctx.lineJoin = 'round'; ctx.strokeStyle = '#24352b'; ctx.lineWidth = 4.5;
+    ctx.fillStyle = '#f0eedb';
     for (const region of this.guide) {
       const [x, y] = this.project(...region.label);
-      ctx.font = 'bold 29px sans-serif';
-      ctx.strokeStyle = '#102323'; ctx.lineWidth = 5; ctx.strokeText(region.name, x, y);
-      ctx.fillStyle = region.color; ctx.fillText(region.name, x, y);
-      ctx.font = 'bold 14px monospace'; ctx.fillStyle = '#b7c9c0'; ctx.fillText(region.code, x, y + 27);
+      ctx.strokeText(region.name, x, y);
+      ctx.fillText(region.name, x, y);
     }
     arrow(ctx, S - 42, 61, 0, 1.45, '#d7eee7');
     ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#e1f1ea'; ctx.fillText('N', S - 42, 34);
@@ -267,8 +282,8 @@ export class MapView {
       marker(ctx, ...this.project(nav.dest.x, nav.dest.z), '#49edff', 9, true);
     }
     for (const region of this.guide) if (region.target) marker(ctx,
-      ...this.project(region.target.x, region.target.z), region.color, 4);
-    for (const e of this.events) marker(ctx, ...this.project(e.pos.x, e.pos.z), e.mapColor, 7, true);
+      ...this.project(region.target.x, region.target.z), '#d7e5d2', 3.4);
+    for (const e of this.events) marker(ctx, ...this.project(e.pos.x, e.pos.z), '#e4b588', 5.8, true);
     if (bigPick) {
       const [x, y] = this.project(bigPick.x, bigPick.z);
       ctx.strokeStyle = '#ffcf80'; ctx.lineWidth = 3; ctx.stroke(circle(x, y, 14));

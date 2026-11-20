@@ -121,30 +121,30 @@ export class Game {
       this.events.push(d);
     }
     this.sprintDefs = sprintDefs;
-    // 光柱 + 底座光环 + 悬浮名牌
-    this.eventRings = [];
+    // Low-key beacon, ground ring and a nameplate revealed on approach.
+    this.eventMarkers = [];
     this.eventGroup = new THREE.Group();
     const beamMatOf = (c) => new THREE.MeshBasicMaterial({
-      color: c, transparent: true, opacity: 0.22,
+      color: c, transparent: true, opacity: 0.085,
       blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
     });
     for (const ev of this.events) {
       const beam = new THREE.Mesh(
-        new THREE.CylinderGeometry(1.1, 1.6, 50, 12, 1, true),
+        new THREE.CylinderGeometry(0.5, 0.95, 11, 12, 1, true),
         beamMatOf(ev.color)
       );
-      beam.position.copy(ev.pos).setY(25);
+      const y = this.world.groundSampler(ev.pos.x, ev.pos.z);
+      beam.position.copy(ev.pos).setY(y + 5.5);
       this.eventGroup.add(beam);
       const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(3.2, 0.18, 8, 26),
+        new THREE.TorusGeometry(3.2, 0.09, 8, 26),
         new THREE.MeshStandardMaterial({
-          color: ev.color, emissive: ev.color, emissiveIntensity: 2.0, metalness: 0.4, roughness: 0.3,
+          color: ev.color, emissive: ev.color, emissiveIntensity: 0.68, metalness: 0.4, roughness: 0.3,
         })
       );
       ring.rotation.x = Math.PI / 2;
-      ring.position.copy(ev.pos).setY(0.6);
+      ring.position.copy(ev.pos).setY(y + 0.25);
       this.eventGroup.add(ring);
-      this.eventRings.push(ring);
       // 名牌
       const cv = document.createElement('canvas');
       cv.width = 256; cv.height = 72;
@@ -162,8 +162,10 @@ export class Game {
       const tex = new THREE.CanvasTexture(cv);
       tex.colorSpace = THREE.SRGBColorSpace;
       const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
-      label.scale.set(18, 5, 1);
-      label.position.copy(ev.pos).setY(7.5);
+      label.scale.set(14, 3.94, 1);
+      label.position.copy(ev.pos).setY(y + 4.9);
+      label.visible = false;
+      this.eventMarkers.push({ ev, beam, label });
       this.eventGroup.add(label);
     }
     this.eventGroup.visible = false; // 仅自由漫游时可见
@@ -1081,7 +1083,13 @@ export class Game {
       if (!near) this.dismissedFor = null;                 // 先判"是否真的驶出范围"
       if (near && near === this.dismissedFor) near = null; // 再过滤已忽略的活动
       this.setPromptEvent(near);
-      this.eventRings.forEach((r) => { r.rotation.z += dt * 1.5; });
+      for (const { ev, beam, label } of this.eventMarkers) {
+        const distance = ev.pos.distanceTo(this.player.pos);
+        beam.visible = distance < 300;
+        beam.material.opacity = 0.085 * (1 - THREE.MathUtils.smoothstep(distance, 100, 300));
+        label.visible = distance < 85;
+        label.material.opacity = 1 - THREE.MathUtils.smoothstep(distance, 44, 85);
+      }
     } else if (this.promptEvent) {
       this.setPromptEvent(null);
     }

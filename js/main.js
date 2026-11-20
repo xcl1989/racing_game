@@ -11,7 +11,7 @@ import { buildWorld } from './world.js';
 import { upgradeRealism } from './realism.js';
 import { setRoadWet } from './roads.js';
 import { makeGlowTexture, makeCloudTexture, createSkyPainter } from './textures.js';
-import { createWeather } from './weather.js';
+import { createWeather, WEATHER_TYPES } from './weather.js';
 import { createOutdoorEnvironment, SUN_DIRECTION, SUN_OFFSET } from './environment.js';
 import { CAR_SPECS } from './cars.js';
 import { damp, angleDelta } from './steering.js';
@@ -47,7 +47,8 @@ const scene = new THREE.Scene();
 const skyPainter = createSkyPainter();
 const skyTex = skyPainter.tex;
 scene.background = skyTex;
-scene.fog = new THREE.Fog(0xd7e9f5, 340, 2700);
+const { fogColor, fogNear, fogFar } = WEATHER_TYPES.sunny;
+scene.fog = new THREE.Fog(fogColor, fogNear, fogFar);
 
 const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.5, 2500);
 camera.position.set(0, 5, -12);
@@ -97,8 +98,8 @@ const clouds = []; // weather.js 按天气调透明度与染色（baseO 存每�
     const y = high ? 380 + Math.random() * 200 : 260 + Math.random() * 220;
     c.position.set(Math.cos(a) * r, y, Math.sin(a) * r);
     const s = (high ? 340 : 260) + Math.random() * 340;
-    c.scale.set(s, s * 0.42, 1);
-    c.material.rotation = Math.random() * Math.PI;
+    c.scale.set(s, s * (high ? 0.29 : 0.40), 1);
+    c.material.rotation = (Math.random() - 0.5) * 0.12;
     c.userData.baseO = baseO;
     scene.add(c);
     clouds.push(c);
@@ -245,7 +246,7 @@ game.toMenu();
 const rain = new RainSystem(scene, isMobile ? 380 : 900);
 const weather = createWeather({
   scene, painter: skyPainter, bakeEnvironment: bakeOutdoorEnvironment,
-  hemi, sun, sunSprite, clouds, fog: scene.fog,
+  hemi, sun, sunSprite, clouds,
   rain, audio,
   onNotice: (n) => game.toast(`天气转${n}了`, 2600),
 });
