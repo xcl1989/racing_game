@@ -1,6 +1,8 @@
 // input.js — 键盘 + 手机触屏虚拟按键统一输入
 // 对外暴露 input 对象：throttle(0..1) brake(0/1) steer(-1..1) handbrake(bool)
 
+import { cruiseThrottle } from './steering.js';
+
 export const input = {
   throttle: 0,
   brake: 0,
@@ -13,30 +15,29 @@ const keys = {};
 function refresh() {
   input.throttle = (keys['w'] || keys['arrowup']) ? 1 : 0;
   input.brake = (keys['s'] || keys['arrowdown']) ? 1 : 0;
-  // 手机转向 = 纯陀螺仪；键盘 A/D 保留给桌面端
+  // Direction buttons override gyro while held; keyboard and gyro still work on their own.
   input.steer = 0;
-  if (keys['a'] || keys['arrowleft']) input.steer -= 1;
-  if (keys['d'] || keys['arrowright']) input.steer += 1;
+  if (keys['a'] || keys['arrowleft'] || touch.left) input.steer -= 1;
+  if (keys['d'] || keys['arrowright'] || touch.right) input.steer += 1;
   if (touch.gas) input.throttle = 1;
   if (touch.brake) input.brake = 1;
-  // 定速巡航（AUTO）：保持当前速度，不默认加速 —— 见下方 cruise 段
-  if (touch.auto) updateCruise();
-  if (gyro.enabled) input.steer = gyro.steer;
+  if (gyro.enabled && !touch.left && !touch.right && !keys['a'] && !keys['d'] &&
+      !keys['arrowleft'] && !keys['arrowright']) input.steer = gyro.steer;
   input.handbrake = !!keys[' ']; // 手刹仅键盘保留，触屏走真实赛车路线不用漂移
+  if (touch.auto) updateCruise();
 }
 
 // ★ 主循环每帧轮询：AUTO/陀螺仪这类“非事件状态”必须每帧重算，
 //   否则要等下一次按键事件才生效
 export function pollInput() { refresh(); }
 
-const touch = { gas: false, brake: false, auto: false };
+const touch = { gas: false, brake: false, left: false, right: false, auto: false };
 
 // ---- 定速巡航（AUTO，v2.17 重做）----
 // 语义：AUTO = 保持当前速度，绝不默认加速。
 //  · 开启瞬间若车静止 → 不给油，原地待命（等人工给过一次油再锁速）
 //  · 巡航中点油门/刹车 = 人工接管（暂停巡航）；松开瞬间锁定当下速度为新目标
-//  · 锁定后用 PI 控制补油：低于目标差得越多油门越大，高于目标直接滑行回目标。
-//    积分项用于消除风阻 `speed*0.4` 与爬坡造成的稳态掉速
+//  · 锁定后用 PI 控制补油；转向期间让出动力，松舵后继续追踪原巡航速度。
 // 车速来源：window.game.player.speed（main.js 尾部调试钩子，m/s）
 const cruise = { target: null, integral: 0, relock: false };
 const CRUISE = { KP: 0.45, KI: 0.55, MAX_I: 2, MIN_LATCH: 0.5 }; // MIN_LATCH m/s 以下不锁速（静止/倒车不自动给油）
@@ -70,11 +71,7 @@ function updateCruise() {
     cruise.integral = 0;
   }
   if (cruise.target == null) return;            // 无锁速目标（静止开启）→ 不给油
-  const gap = cruise.target - spd;
-  const dt = pollDt();
-  if (Math.abs(gap) > 0.02) cruise.integral = Math.max(-CRUISE.MAX_I,
-    Math.min(CRUISE.MAX_I, cruise.integral + gap * dt));
-  input.throttle = Math.max(0, Math.min(1, CRUISE.KP * gap + CRUISE.KI * cruise.integral));
+  input.throttle = cruiseThrottle(cruise, spd, input.steer, pollDt(), CRUISE);
 }
 
 // ---- 陀螺仪转向 ----
@@ -91,17 +88,18 @@ function onOrient(e) {
   const type = (screen.orientation && screen.orientation.type) || '';
   let tilt;
   if (type.indexOf('landscape') === 0) {
+    if (e.beta == null) return;
     tilt = e.beta * (type === 'landscape-primary' ? 1 : -1);
   } else {
     tilt = e.gamma;
   }
-  if (tilt == null) return;
+  if (!Number.isFinite(tilt)) return;
   if (gyro.offset == null) gyro.offset = tilt;
   const d = tilt - gyro.offset;
-  const dz = 5;                              // 死区 5°，握稳不乱晃
+  const dz = 4;                              // 死区 4°，握稳不乱晃
   gyro.steer = Math.abs(d) < dz
     ? 0
-    : Math.max(-1, Math.min(1, (d - Math.sign(d) * dz) / 45)); // 倾斜 45° 才满舵，真实感
+    : Math.max(-1, Math.min(1, (d - Math.sign(d) * dz) / 32)); // 死区外 32° 到满舵
 }
 
 // 开/关陀螺仪；iOS 13+ 需要用户手势触发权限申请
@@ -136,19 +134,27 @@ export function toggleGyro() {
 function bindBtn(id, prop) {
   const el = document.getElementById(id);
   if (!el) return;
-  const down = (e) => { e.preventDefault(); touch[prop] = true; el.classList.add('active'); refresh(); };
-  const up = (e) => { e.preventDefault(); touch[prop] = false; el.classList.remove('active'); refresh(); };
+  let pointer = null;
+  const release = () => { pointer = null; touch[prop] = false; el.classList.remove('active'); refresh(); };
+  const down = e => {
+    if (e.button !== 0 || pointer !== null) return;
+    e.preventDefault(); pointer = e.pointerId;
+    if (el.hasPointerCapture(e.pointerId) || e.isTrusted) el.setPointerCapture(e.pointerId);
+    touch[prop] = true; el.classList.add('active'); refresh();
+  };
+  const up = e => { if (e.pointerId === pointer) release(); };
   el.addEventListener('pointerdown', down);
-  el.addEventListener('pointerup', up);
-  el.addEventListener('pointercancel', up);
-  el.addEventListener('pointerleave', up);
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture', 'pointerleave']) el.addEventListener(type, up);
+  window.addEventListener('blur', release);
+
 }
 
 export function initInput(onPause) {
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
+    if (k === ' ' && e.target instanceof HTMLButtonElement) return;
     keys[k] = true;
-    if (k === 'escape') onPause && onPause();
+    if (k === 'escape' && !e.repeat) onPause && onPause();
     if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
     refresh();
   });
@@ -156,6 +162,13 @@ export function initInput(onPause) {
 
   bindBtn('btn-gas', 'gas');
   bindBtn('btn-brake', 'brake');
+  bindBtn('btn-steer-left', 'left');
+  bindBtn('btn-steer-right', 'right');
+  window.addEventListener('blur', () => {
+    for (const key of Object.keys(keys)) delete keys[key];
+    refresh();
+  });
+  window.addEventListener('orientationchange', () => { gyro.offset = null; gyro.steer = 0; });
 
   // AUTO 定速巡航开关（点按切换）；托管时油门键变暗降噪
   const autoEl = document.getElementById('btn-auto');

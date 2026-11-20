@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { HALF_WIDTH } from './track.js';
 import { buildCarModel } from './cars.js';
+import { angleDelta, cornering, damp, steerInput, turnAssist } from './steering.js';
 
 // ---- GLB 模板加载（一次加载，多车克隆）----
 let _loader = null;
@@ -443,6 +444,8 @@ export class PlayerCar {
     this.speed = 0;        // m/s，负值=倒车
     this.driftYaw = 0;     // 甩尾视觉偏航
     this.steerSm = 0;      // 平滑后的转向输入
+    this.bodyRoll = this.bodyPitch = 0;
+    this.yawRate = 0;
     this.throttleSm = 0;   // 平滑后的油门
     this.hint = -1;        // 赛道最近样条提示
     this.trackT = 0;       // 归一化赛道进度 0..1
@@ -474,6 +477,12 @@ export class PlayerCar {
     this.pos.copy(pos); this.yaw = yaw; this.speed = 0;
     this.travelYaw = yaw; this.slip = 0;
     this.driftYaw = 0; this.total = 0;
+    this.steerSm = this.throttleSm = this.yawRate = 0;
+    this.bodyRoll = this.bodyPitch = 0;
+    for (const w of this.wheels) if (w.steer) {
+      for (const m of w.meshes) m.rotation.y = 0;
+      for (const m of w.static || []) if (/caliper|brake/i.test(m.name)) m.rotation.y = 0;
+    }
     this.syncMesh();
   }
 
@@ -498,10 +507,11 @@ export class PlayerCar {
 
     // ★ 屏幕方向修正：相机从车尾看向 +Z 时水平轴镜像，
     //   yaw 增大会让车往屏幕"左"跑，所以转向取反才符合直觉。
-    // ★ 输入平滑：转向 v2.30 收紧到 dt*9（时间常数 167ms→111ms，更跟手）；油门保持 6
-    this.steerSm += (-ctrl.steer - this.steerSm) * Math.min(1, dt * 9);
-    this.throttleSm += (ctrl.throttle - this.throttleSm) * Math.min(1, dt * 6);
+    this.steerSm = steerInput(this.steerSm, ctrl.steer, this.speed, dt);
+    this.throttleSm = damp(this.throttleSm, ctrl.throttle, dt, 6);
     const steer = this.steerSm;
+    const previousSpeed = this.speed;
+    const assist = turnAssist(steer, this.speed, ctrl.handbrake);
 
     // ================= v2.30 纵向动力量纲重标（手感重做）=================
     // 旧版把 CAR_SPECS 的 accel 26~45 / brake 29~38 直接当 m/s² 消费 = 2.6~4.6g 加速、4.7g 制动
@@ -514,7 +524,7 @@ export class PlayerCar {
     if (this.throttleSm > 0.02) {
       // 功率曲线：中后段推力衰减（低速猛、高速缓），极速仍由 CAP 精确封顶
       const vN = Math.min(1, spdAbs / Math.max(1, MAX));
-      this.speed += aAccel * (1 - 0.50 * vN * vN) * this.throttleSm * dt * accF;
+      this.speed += aAccel * (1 - 0.50 * vN * vN) * this.throttleSm * assist.power * dt * accF;
     }
     if (ctrl.brake) this.speed -= aBrake * dt * (this.speed > 0 ? 1 : 0.5) * (1 - wet * 0.35);
     {
@@ -523,6 +533,7 @@ export class PlayerCar {
       const drag = 0.02 * v + 0.00045 * v * v + surfF * 0.55;
       this.speed -= Math.sign(this.speed) * drag * dt;
     }
+    if (assist.slow > 0 && this.speed > 0) this.speed = Math.max(0, this.speed - assist.slow * dt);
     if (ctrl.handbrake) this.speed -= this.speed * 0.9 * dt;   // 手刹减速（仅键盘）
     if (this.offroad && Math.abs(this.speed) > MAX)
       this.speed -= Math.sign(this.speed) * 40 * dt;
@@ -530,42 +541,20 @@ export class PlayerCar {
     const CAP = MAX + (this.offroad ? 8 : 0);
     this.speed = Math.max(-8, Math.min(CAP, this.speed));
 
-    // ================= v2.30 转向：横向抓地上限（核心手感）=================
-    // 旧版只按速度收窄转向速率、没有轮胎侧向力上限 → 实测 99km/h 满舵 = 23.5m 转弯半径 / 3.27g，
-    // 车像无人机（无质量、无惯性）。现在叠加真实约束 ω ≤ a_lat / v：
-    //   抓地 1.04 × 街机宽容 1.25 ≈ 1.3g → 99km/h 最小半径约 60m，223km/h 约 300m
     const spd = Math.abs(this.speed);
-    const baseRate = 1.85 * S.grip * Math.min(1, spd / 12) * (1 - 0.40 * Math.min(1, spd / MAX))
-      * (1 - wet * 0.22); // 雨天转向变钝
-    const latCap = 9.8 * S.grip * 1.25 * (1 - wet * 0.18) * (1 - surfF * 0.40); // 侧向加速度上限 m/s²
-    const gripRate = latCap / Math.max(6, spd);   // ω 上限（低速时该值很大 = 不生效）
-    // ⚠️ 必须用"实际打舵需求的角速度"判定超限：只看 baseRate 会让直行也判超限，
-    //    结果直行被持续拖速（极速被压到 140km/h、松油门 15m/s² 减速的 bug 根因）
-    const demand = baseRate * Math.abs(steer);
-    const overGrip = demand > gripRate;           // 打舵需求超过轮胎极限 → 推头/侧滑
-    const turnRate = Math.min(baseRate, gripRate);
-    let turn = steer * turnRate * (this.speed < 0 ? -1 : 1);
-    if (ctrl.handbrake) turn *= 1.5;
-    this.yaw += turn * dt;
+    const turn = cornering(steer, this.speed, S.grip, wet, surfF, ctrl.handbrake);
+    this.yawRate = turn.yawRate;
+    this.yaw += this.yawRate * dt;
+    this.travelYaw += damp(0, angleDelta(this.travelYaw, this.yaw), dt, turn.alignRate);
+    this.slip = angleDelta(this.travelYaw, this.yaw);
+    const drift = ctrl.handbrake ? Math.min(1, Math.max(0, (spd - 8) / 12)) * steer * .29 : 0;
+    this.driftYaw = damp(this.driftYaw, drift + this.slip * .43, dt, 6);
 
-    // ================= v2.30 车身惯性：运动方向滞后于车头 =================
-    // 车头（yaw）先转，实际轨迹（travelYaw）按抓地力追上 → 侧滑角 slip + 甩尾视觉。
-    // 这是"车有重量"的来源：旧版轨迹 = 车头，任何舵量都瞬间变道。
-    let dTravel = this.yaw - this.travelYaw;
-    while (dTravel > Math.PI) dTravel -= Math.PI * 2;
-    while (dTravel < -Math.PI) dTravel += Math.PI * 2;
-    let alignRate = (overGrip ? 4.2 : 9.0) * (1 - surfF * 0.45) * (1 - wet * 0.25);
-    if (ctrl.handbrake) alignRate *= 0.55;        // 手刹：抓地力骤降（真漂移）
-    this.travelYaw += dTravel * Math.min(1, dt * alignRate);
-    this.slip = dTravel;                          // 滑移角（rad）供响胎/相机/侧倾消费
-
-    this.driftYaw += (((ctrl.handbrake && spd > 14 ? steer * 0.35 : 0) + this.slip * 0.55)
-      - this.driftYaw) * Math.min(1, dt * 5);
-    // 超出抓地极限才耗散动能（按打舵超限量平方，走线正常/直行不拖速）
-    if (overGrip && spd > 8) {
-      const ex = Math.min(1, (demand - gripRate) / Math.max(0.01, demand));
-      this.speed -= this.speed * ex * ex * 0.35 * Math.abs(steer) * dt;
-    }
+    // Suspension feedback is visual; collision and progress still use yaw and position.
+    const lateral = this.yawRate * this.speed;
+    this.bodyRoll = damp(this.bodyRoll, THREE.MathUtils.clamp(lateral * .005, -.075, .075), dt, 8);
+    const accel = (this.speed - previousSpeed) / Math.max(dt, .001);
+    this.bodyPitch = damp(this.bodyPitch, THREE.MathUtils.clamp(-accel * .003, -.037, .052), dt, 9);
 
     this.pos.x += Math.sin(this.travelYaw) * this.speed * dt;
     this.pos.z += Math.cos(this.travelYaw) * this.speed * dt;
@@ -612,12 +601,12 @@ export class PlayerCar {
     for (const w of this.wheels) {
       for (const m of w.meshes) {
         m.rotation.x += spin;
-        if (w.steer) m.rotation.y = steer * 0.4;
+        if (w.steer) m.rotation.y = turn.wheel;
       }
       if (w.steer && w.static) for (const m of w.static) {
         // v2.13.2 只跟随卡钳/刹车件（随转向节）；轮拱内衬等静件贴车身不随转向
         const n = (m.name || '').toLowerCase();
-        if (n.includes('caliper') || n.includes('brake')) m.rotation.y = steer * 0.4;
+        if (n.includes('caliper') || n.includes('brake')) m.rotation.y = turn.wheel;
       }
     }
     this.syncMesh();
@@ -635,7 +624,8 @@ export class PlayerCar {
   syncMesh() {
     this.group.position.copy(this.pos);
     this.group.rotation.y = this.yaw + this.driftYaw;
-    this.group.rotation.z = -this.driftYaw * 0.6; // 甩尾侧倾
+    this.group.rotation.x = this.bodyPitch;
+    this.group.rotation.z = this.bodyRoll;
   }
 }
 

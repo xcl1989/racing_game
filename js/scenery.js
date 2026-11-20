@@ -6,6 +6,7 @@ import {
   makeBillboardTexture, makeBirdTexture, makeFieldTexture,
 } from './textures.js';
 import { firCrown } from './scene-detail.js';
+import { LAKE } from './world-guide.js';
 import { HALF_WIDTH } from './track.js';
 import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
 import { makeFoliageTexture } from './textures.js';           // v2.25 叶丛斑驳贴图
@@ -86,7 +87,7 @@ export function buildScenery(scene, track, world, rich = true) {
   // ---- 湖（盆地下切后的水面：低于地面 1.5m，盆缘 136-146 收紧成陡岸）----
   // 新位置 (660,-560)；world.js 湖滨路环岛与湖东野径按此坐标衔接（野径 d≥145 贴岸顶）
   // v2.24 换 water.js 材质（顶点波浪/菲涅尔/泡沫）；方形细分网格承载波浪，水线由地形反推 d≈136
-  const lakePos = { x: 660, z: -560, r: 138 };
+  const lakePos = LAKE;
   if (distToTrack(lakePos.x, lakePos.z) > 120) {
     const lakeNormal = makeWaterNormal();
     lakeNormal.repeat.set(23, 23); // ~14m/格
@@ -94,7 +95,7 @@ export function buildScenery(scene, track, world, rich = true) {
       new THREE.PlaneGeometry(330, 330, 64, 64),
       makeWaterMaterial({
         deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.95,
-        shoreMode: 'circle', center: [lakePos.x, lakePos.z], shoreR: 136,
+        shoreMode: 'circle', center: [lakePos.x, lakePos.z], shoreR: lakePos.r,
         band: 26, foamBand: 3.5, waveAmp: 0.06,
         normalTex: lakeNormal, normalScale: 0.4, repeat: 23,
       })
@@ -121,7 +122,7 @@ export function buildScenery(scene, track, world, rich = true) {
     const dirX = 820 - lakePos.x, dirZ = -420 - lakePos.z;
     const dl = Math.hypot(dirX, dirZ);
     const ux = dirX / dl, uz = dirZ / dl;
-    const shoreX = lakePos.x + ux * lakePos.r, shoreZ = lakePos.z + uz * lakePos.r;
+    const shoreX = lakePos.x + ux * (lakePos.r + 2), shoreZ = lakePos.z + uz * (lakePos.r + 2);
     pier.position.set(shoreX + ux * 30, -0.55, shoreZ + uz * 30);
     // 组 y=-0.55：岸端板面 ≈ +0.2 齐地面，水上端悬于水面 1.7m 的架高板道
     pier.rotation.y = Math.atan2(ux, uz); // 长轴(+Z)沿伸入湖心的方向

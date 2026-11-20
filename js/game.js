@@ -1,6 +1,7 @@
 // game.js — 游戏逻辑：模式管理 / 检查点与圈数 / 收集挑战 / HUD / 小地图 / 导航
 import * as THREE from 'three';
 import { gyroState } from './input.js';
+import { MapView } from './map-view.js';
 import { buildNavGraph, findRoute, NavGuide } from './nav.js';
 import { eventReward, markRaceResult, ODO_STEP, ODO_MIN_SPEED, ODO_FRAME_CAP } from './economy.js'; // v2.32 积分经济
 
@@ -43,42 +44,22 @@ export class Game {
     this._savedPos = null;       // 比赛中不覆盖存档位置（读档点兜底）
     this.sprint = null;          // {def, R, cursor, playerTotal, nextCp, cps, gates}
 
-    // 小地图缩放档位：点击循环切换（s = 像素/米）
     this.mmZooms = [
-      { label: '全景', s: 0.042 },  // 约容纳 3.5km 视野（整个大世界）
-      { label: '1km', s: 0.15 },
-      { label: '500m', s: 0.3 },
-      { label: '200m', s: 0.75 },
+      { label: '自动', range: 245, auto: true },
+      { label: '200 m', range: 200 },
+      { label: '600 m', range: 600 },
+      { label: '全图', range: 0 },
     ];
-    this.mmZoomIdx = 3; // 默认 200m：接近原 GPS 视角
+    this.mmZoomIdx = 0;
 
     this.buildRings();
     this.buildEvents();
-    this.buildMinimapBase();
-    this.bindUI();
-    // ---- 导航（v2.18）：路网图 + A* + 3D 流光线；长按小地图开大地图点选目的地 ----
+    this.mapView = new MapView(world, track, $('minimap'), $('bigMapCanvas'));
+    this.mapView.events = this.events.map(e => ({ ...e, mapColor: `#${e.color.toString(16).padStart(6, '0')}` }));
     this.navGraph = buildNavGraph(this.world, this.track);
     this.navGuide = new NavGuide(this.track.gatesGroup.parent);
-    this.nav = null; // { name, dest, pts, cum, cursor, rerouteT, fallback }
-    this.buildBigMap();
-    // 小地图交互：短按=切缩放档；长按 450ms=打开导航面板
-    const mm = document.getElementById('minimap');
-    mm.addEventListener('pointerdown', () => {
-      this._mmDownAt = performance.now();
-      this._mmLp = setTimeout(() => { this._mmLp = null; this.openBigMap(); }, 450);
-    });
-    const mmEnd = (fire) => {
-      if (!this._mmLp) return;
-      clearTimeout(this._mmLp);
-      this._mmLp = null;
-      if (fire && performance.now() - this._mmDownAt < 450) {
-        this.mmZoomIdx = (this.mmZoomIdx + 1) % this.mmZooms.length;
-        this.audio.beep(660, 0.08, 0.1);
-      }
-    };
-    mm.addEventListener('pointerup', () => mmEnd(true));
-    mm.addEventListener('pointercancel', () => mmEnd(false));
-    mm.addEventListener('pointerleave', () => mmEnd(false));
+    this.nav = null;
+    this.bindUI();
   }
 
   // ---- 地图活动（Forza 式光柱：开进去即可报名）----
@@ -261,207 +242,12 @@ export class Game {
     this.track.gatesGroup.parent.add(this.ringGroup); // 挂到 scene
   }
 
-  // ---- 小地图底图（全路网：环道+高速+城市+乡道）----
-  buildMinimapBase() {
-    const S = 150;
-    this.mapBase = document.createElement('canvas');
-    this.mapBase.width = S; this.mapBase.height = S;
-    const x = this.mapBase.getContext('2d');
-    let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
-    const grow = (wx, wz) => {
-      minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
-      minZ = Math.min(minZ, wz); maxZ = Math.max(maxZ, wz);
-    };
-    for (const s of this.track.samples) grow(s.pos.x, s.pos.z);
-    for (const poly of this.world.minimapPolylines) {
-      for (const [wx, wz] of poly) grow(wx, wz);
-    }
-    const pad = 10;
-    const sc = Math.min((S - pad * 2) / (maxX - minX), (S - pad * 2) / (maxZ - minZ));
-    this.mapFn = (wx, wz) => [pad + (wx - minX) * sc, S - pad - (wz - minZ) * sc];
-    const drawPoly = (poly, style, width) => {
-      x.strokeStyle = style;
-      x.lineWidth = width;
-      x.beginPath();
-      poly.forEach(([wx, wz], i) => {
-        const [mx, my] = this.mapFn(wx, wz);
-        i === 0 ? x.moveTo(mx, my) : x.lineTo(mx, my);
-      });
-      x.stroke();
-    };
-    const [hwPoly, ctryPoly, firstStreet] = this.world.minimapPolylines;
-    // v2.13 道路统一灰阶（宽度分级保主次，不再五颜六色）
-    drawPoly(hwPoly, 'rgba(150,155,162,0.95)', 5);   // 高速
-    drawPoly(ctryPoly, 'rgba(172,176,182,0.95)', 3); // 乡道
-    drawPoly(firstStreet, 'rgba(172,176,182,0.95)', 2); // 街道
-    for (let i = 3; i < this.world.minimapPolylines.length; i++) {
-      drawPoly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 2); // 街道网格
-    }
-    x.strokeStyle = 'rgba(178,182,188,0.95)';
-    x.lineWidth = 4;
-    x.beginPath();
-    this.track.samples.forEach((s, i) => {
-      const [mx, my] = this.mapFn(s.pos.x, s.pos.z);
-      i === 0 ? x.moveTo(mx, my) : x.lineTo(mx, my);
-    });
-    x.closePath();
-    x.stroke();
-    // 起点标记
-    const [sx, sy] = this.mapFn(this.track.startPos.x, this.track.startPos.z);
-    x.fillStyle = '#ffdd44';
-    x.beginPath(); x.arc(sx, sy, 4, 0, Math.PI * 2); x.fill();
-  }
-
-  // ---- GPS 式旋转小地图：车居中箭头朝上，地图跟随旋转；点击切档 ----
-  drawMinimap() {
-    const c = $('minimap');
-    const x = c.getContext('2d');
-    const S = c.width;
-    x.clearRect(0, 0, S, S);
-    const zoom = this.mmZooms[this.mmZoomIdx];
-    const s = zoom.s; // 缩放：像素/米
-    const yaw = this.player.yaw;
-    const px = this.player.pos.x, pz = this.player.pos.z;
-    const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
-    // 世界坐标 → 屏幕坐标（车头朝上）
-    const toScreen = (wx, wz) => [
-      S / 2 + (-(wx - px) * cosY + (wz - pz) * sinY) * s,
-      S / 2 + (-(wx - px) * sinY - (wz - pz) * cosY) * s,
-    ];
-    const onMap = ([mx, my]) => mx > -6 && mx < S + 6 && my > -6 && my < S + 6;
-
-    // 线宽补偿：缩得越远线越细，用平方根压缩保持可见但不虚胖
-    const lwBoost = Math.sqrt(1.1 / s);
-
-    // 道路层：地图随车旋转
-    x.save();
-    x.translate(S / 2, S / 2);
-    x.scale(s, s);
-    x.rotate(Math.PI + yaw);
-    x.translate(-px, -pz);
-    const poly = (pts, style, w) => {
-      x.strokeStyle = style;
-      x.lineWidth = w * lwBoost;
-      x.beginPath();
-      pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
-      x.stroke();
-    };
-    const [hwPoly, ctryPoly, firstStreet] = this.world.minimapPolylines;
-    // v2.13 道路统一灰阶（宽度分级保主次）
-    poly(hwPoly, 'rgba(150,155,162,0.95)', 20);   // 高速
-    poly(ctryPoly, 'rgba(172,176,182,0.95)', 12); // 乡道
-    poly(firstStreet, 'rgba(172,176,182,0.95)', 10); // 街道
-    for (let i = 3; i < this.world.minimapPolylines.length; i++) {
-      poly(this.world.minimapPolylines[i], 'rgba(172,176,182,0.95)', 10); // 街道网格
-    }
-    const ST = this.track.strip;
-    poly([[ST.ax, ST.az], [ST.bx, ST.bz]], 'rgba(160,165,171,0.95)', 10); // 直线赛道
-    x.strokeStyle = 'rgba(178,182,188,0.95)';
-    x.lineWidth = 8 * lwBoost;
-    x.beginPath();
-    this.track.samples.forEach((sm, i) => i === 0 ? x.moveTo(sm.pos.x, sm.pos.z) : x.lineTo(sm.pos.x, sm.pos.z));
-    x.closePath();
-    x.stroke();
-    // 导航路线高亮（v2.18；v2.27 改造）：
-    //  ① 屏幕像素恒宽（旧版用世界单位线宽，全景档 s=0.042 时只有 ~1px 几乎不可见）
-    //  ② 不闭合（closePath 会画"终点连回起点"的假边）
-    //  ③ 画在道路层之后最上层（主环道白线此前会盖住路线）
-    //  ④ 深色描边衬底：在草地/浅色路面上也有对比度
-    if (this.nav && this.mode === 'free') {
-      const navPts = this.nav.pts.map((p) => [p.x, p.z]);
-      const openPx = (pts, style, pxw) => {
-        x.strokeStyle = style;
-        x.lineWidth = pxw / s; // scale(s,s) 下除以 s → 恒定像素宽
-        x.beginPath();
-        pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
-        x.stroke();
-      };
-      openPx(navPts, 'rgba(4,26,36,0.7)', 7.5);
-      openPx(navPts, 'rgba(46,230,255,0.95)', 4.5);
-    }
-    // v2.32 冲刺/越野赛路线高亮（画法同导航：恒定像素宽 + 深色衬底 + 不闭合）
-    const spR = (this.mode === 'sprint' || this.mode === 'offroad') && this.sprint ? this.sprint.R : null;
-    if (spR) {
-      const rPts = spR.samples.map((sm) => [sm.pos.x, sm.pos.z]);
-      const openSp = (pts, style, pxw) => {
-        x.strokeStyle = style;
-        x.lineWidth = pxw / s;
-        x.beginPath();
-        pts.forEach(([wx, wz], i) => i === 0 ? x.moveTo(wx, wz) : x.lineTo(wx, wz));
-        x.stroke();
-      };
-      openSp(rPts, 'rgba(4,26,36,0.7)', 7.5);
-      openSp(rPts, this.sprint.def.mode === 'offroad' ? 'rgba(136,255,68,0.95)' : 'rgba(255,119,204,0.95)', 4.5);
-    }
-    x.restore();
-
-    // 圆点层（屏幕空间，超出裁掉）
-    const dot = (wx, wz, color, r) => {
-      const m = toScreen(wx, wz);
-      if (!onMap(m)) return;
-      x.fillStyle = color;
-      x.beginPath(); x.arc(m[0], m[1], r, 0, Math.PI * 2); x.fill();
-      x.lineWidth = 1;
-      x.strokeStyle = 'rgba(0,0,0,0.55)';
-      x.stroke();
-    };
-    if (this.mode !== 'drag') {
-      for (const ev of this.events) dot(ev.pos.x, ev.pos.z, `#${ev.color.toString(16).padStart(6, '0')}`, 4);
-    }
-    // 导航目的地旗点（v2.18）
-    if (this.nav && this.mode === 'free') {
-      const m = toScreen(this.nav.dest.x, this.nav.dest.z);
-      if (onMap(m)) {
-        const pulse = 4 + Math.sin(performance.now() / 180) * 1.2;
-        x.fillStyle = '#2ee6ff';
-        x.beginPath(); x.arc(m[0], m[1], pulse, 0, Math.PI * 2); x.fill();
-        x.strokeStyle = '#ffffff'; x.lineWidth = 1.5; x.stroke();
-      }
-    }
-    for (const ai of this.ais) {
-      if (ai.group.visible) dot(ai.pos.x, ai.pos.z, `#${ai.color.toString(16).padStart(6, '0')}`, 3.5);
-    }
-    for (const t of this.traffic) {
-      if (t.group.visible) dot(t.pos.x, t.pos.z, 'rgba(235,235,235,0.95)', 2.5);
-    }
-    if (this.ringGroup.visible) {
-      for (const r of this.rings) {
-        if (r.userData.done) continue;
-        dot(r.position.x, r.position.z, '#22ddff', 2.5);
-      }
-    }
-
-    // 北向指示（随旋转移动）
-    const nx = S / 2 + sinY * (S / 2 - 12), ny = S / 2 + cosY * (S / 2 - 12);
-    x.fillStyle = '#ffffff';
-    x.font = 'bold 11px sans-serif';
-    x.textAlign = 'center';
-    x.textBaseline = 'middle';
-    x.fillText('N', nx, ny);
-
-    // 当前档位标签（左下角）
-    x.fillStyle = 'rgba(255,255,255,0.85)';
-    x.font = '10px sans-serif';
-    x.textAlign = 'left';
-    x.fillText(zoom.label, 6, S - 8);
-
-    // 玩家箭头（居中，指向正上）
-    x.fillStyle = '#ff3344';
-    x.strokeStyle = '#ffffff';
-    x.lineWidth = 1.5;
-    x.beginPath();
-    x.moveTo(S / 2, S / 2 - 8);
-    x.lineTo(S / 2 + 5.5, S / 2 + 6);
-    x.lineTo(S / 2, S / 2 + 3);
-    x.lineTo(S / 2 - 5.5, S / 2 + 6);
-    x.closePath();
-    x.fill();
-    x.stroke();
-  }
+  drawMinimap() { this.mapView.drawMini(this); }
 
   // ---- 模式启动 ----
   startMode(mode, ev = null) {
     this.mode = mode;
+    this.sprint = null;
     // 自由漫游免倒计时直接开跑；其余模式 3.2s 倒计时
     this.state = mode === 'free' ? 'running' : 'countdown';
     this.countdown = 3.2;
@@ -588,9 +374,9 @@ export class Game {
       this.toast('开到地图上的彩色光柱即可报名比赛', 3500);
     } else {
       this.toast('准备…', 1200);
-      // 手机转向只靠陀螺仪：没开就提醒（iOS 需手动授权）
+      // 陀螺仪不可用时仍可使用触屏方向键。
       if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) && !gyroState.enabled) {
-        this.toast('⚠ 未开启陀螺仪，无法转向！回主菜单点「陀螺仪: 开」', 3500);
+        this.toast('可用屏幕方向键转向，也可在主菜单开启陀螺仪', 3500);
       }
     }
   }
@@ -616,7 +402,7 @@ export class Game {
   }
 
   togglePause() {
-    if ($('bigMap').style.display !== 'none') return; // 大地图打开时忽略 Esc 暂停（已暂停中）
+    if ($('bigMap').style.display !== 'none') { this.closeBigMap(); return; }
     if (this.state === 'running' || this.state === 'countdown') {
       this._stateBeforePause = this.state; // 保存暂停前状态（倒计时中暂停 → 回到倒计时）
       this.state = 'paused';
@@ -640,155 +426,61 @@ export class Game {
     if (dur < 99999) this._tt = setTimeout(() => { t.style.display = 'none'; }, dur);
   }
 
-  // ---- 导航（v2.18）：长按小地图开大地图 → 点选目的地 → A* 路网寻路 → 流光线 + HUD 距离 ----
-  buildBigMap() {
-    const S = 1024;
-    this.bmSize = S;
-    // 底图：全路网静态渲染一次（画进离屏 canvas，动态层每帧只 drawImage + 少量点）
-    this.bmBase = document.createElement('canvas');
-    this.bmBase.width = S; this.bmBase.height = S;
-    const x = this.bmBase.getContext('2d');
-    // 边界（与 buildMinimapBase 同源数据：track + minimapPolylines）
-    let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
-    const grow = (wx, wz) => {
-      minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
-      minZ = Math.min(minZ, wz); maxZ = Math.max(maxZ, wz);
-    };
-    for (const s of this.track.samples) grow(s.pos.x, s.pos.z);
-    for (const poly of this.world.minimapPolylines) for (const [wx, wz] of poly) grow(wx, wz);
-    const pad = 24;
-    const sc = Math.min((S - pad * 2) / (maxX - minX), (S - pad * 2) / (maxZ - minZ));
-    this.bmFn = (wx, wz) => [pad + (wx - minX) * sc, S - pad - (wz - minZ) * sc];
-    // 反算（大地图点选 → 世界坐标）
-    this.bmInv = (mx, my) => [(mx - pad) / sc + minX, (S - pad - my) / sc + minZ];
-    // 背景
-    x.fillStyle = 'rgba(6, 11, 22, 0.96)';
-    x.fillRect(0, 0, S, S);
-    const line = (pts, style, w) => {
-      x.strokeStyle = style; x.lineWidth = w; x.beginPath();
-      pts.forEach(([wx, wz], i) => {
-        const [a, b] = this.bmFn(wx, wz);
-        i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
-      });
-      x.stroke();
-    };
-    const polys = this.world.minimapPolylines;
-    line(polys[0], 'rgba(176,182,192,0.95)', 9);  // 高速
-    line(polys[1], 'rgba(150,157,168,0.95)', 6);  // 乡道
-    line(polys[2], 'rgba(132,140,152,0.9)', 4);  // 街道
-    for (let i = 3; i < polys.length; i++) line(polys[i], 'rgba(132,140,152,0.9)', 4); // 街道与其余路
-    x.strokeStyle = 'rgba(150,157,168,0.95)'; x.lineWidth = 7;
-    x.beginPath();
-    this.track.samples.forEach((sm, i) => {
-      const [a, b] = this.bmFn(sm.pos.x, sm.pos.z);
-      i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
-    });
-    x.closePath(); x.stroke();
-    // 起点标记
-    const [sx, sy] = this.bmFn(this.track.startPos.x, this.track.startPos.z);
-    x.fillStyle = '#ffdd44';
-    x.beginPath(); x.arc(sx, sy, 6, 0, Math.PI * 2); x.fill();
-  }
-
   openBigMap() {
-    // v2.19.1：打开地图即暂停游戏（关图恢复原状态；导航 tick/物理/车流全部冻结）
-    if (this.state === 'running' || this.state === 'countdown') {
+    if (!['running', 'countdown', 'paused'].includes(this.state) || $('bigMap').style.display !== 'none') return;
+    this._mapFocus = document.activeElement;
+    if (this.state !== 'paused') {
       this._stateBeforeMap = this.state;
       this.state = 'paused';
     }
     $('bigMap').style.display = 'flex';
-    this.bigPick = null;                 // 本次打开的待确认点
+    this.bigPick = null;
     $('btn-nav-go').disabled = true;
-    $('bm-hint').textContent = '点选地图任意位置作为目的地';
-    $('btn-nav-cancel-route').style.display = this.nav ? 'inline-block' : 'none';
-    this.audio.setSpeed(0, false); // 引擎音随暂停熄火
+    $('bm-hint').textContent = '点地图或选择区域；确认后开始导航。';
+    $('btn-nav-cancel-route').style.display = this.nav ? '' : 'none';
+    this.drawBigMap();
+    $('btn-bigmap-close').focus({ preventScroll: true });
+    this.audio.setSpeed(0, false);
     this.audio.beep(520, 0.1, 0.15);
   }
 
   closeBigMap() {
+    if ($('bigMap').style.display === 'none') return;
     $('bigMap').style.display = 'none';
-    // 恢复打开前的状态（用户本就暂停 → 恢复暂停）
-    if (this._stateBeforeMap && this.state === 'paused') {
-      this.state = this._stateBeforeMap;
-      this._stateBeforeMap = null;
-      if (this.state === 'running') this.audio.setSpeed(this.player.speed, true, this.player.throttleSm);
-    }
+    if (this._stateBeforeMap && this.state === 'paused') this.state = this._stateBeforeMap;
+    this._stateBeforeMap = null;
+    this._mapFocus?.focus({ preventScroll: true });
+    this._mapFocus = null;
   }
 
-  // 大地图点选：放置/移动标记；靠近活动光柱自动识别名称
-  pickBigMap(ev) {
-    const cv = $('bigMapCanvas');
-    const r = cv.getBoundingClientRect();
-    const mx = (ev.clientX - r.left) * (this.bmSize / r.width);
-    const my = (ev.clientY - r.top) * (this.bmSize / r.height);
-    const [wx, wz] = this.bmInv(mx, my);
-    this.bigPick = { x: wx, z: wz, name: '自定义目的地' };
-    for (const e of this.events) {
-      if (Math.hypot(e.pos.x - wx, e.pos.z - wz) < 60) {
-        this.bigPick = { x: e.pos.x, z: e.pos.z, name: e.name };
-        break;
-      }
-    }
+  setMapPick(x, z, name) {
+    this.bigPick = { x, z, name };
     $('btn-nav-go').disabled = false;
-    $('bm-hint').textContent = `目的地：${this.bigPick.name}（点${'「'}开始导航${'」'}确认）`;
+    $('bm-hint').textContent = `目的地：${name}`;
+    this.drawBigMap();
     this.audio.beep(700, 0.08, 0.12);
   }
 
-  // 大地图动态层（drawMinimap 每帧连带调用：地图打开时车/AI 仍在动）
-  drawBigMap() {
-    if ($('bigMap').style.display === 'none') return;
+  pickBigMap(ev) {
     const cv = $('bigMapCanvas');
-    const x = cv.getContext('2d');
-    const S = this.bmSize;
-    x.clearRect(0, 0, S, S);
-    x.drawImage(this.bmBase, 0, 0);
-    // 导航路线
-    if (this.nav) {
-      x.strokeStyle = 'rgba(46,230,255,0.95)';
-      x.lineWidth = 4;
-      x.beginPath();
-      this.nav.pts.forEach((p, i) => {
-        const [a, b] = this.bmFn(p.x, p.z);
-        i === 0 ? x.moveTo(a, b) : x.lineTo(a, b);
-      });
-      x.stroke();
-      // 导航目的地脉冲
-      const [dx, dy] = this.bmFn(this.nav.dest.x, this.nav.dest.z);
-      const pr = 9 + Math.sin(performance.now() / 180) * 3;
-      x.fillStyle = 'rgba(46,230,255,0.5)';
-      x.beginPath(); x.arc(dx, dy, pr + 5, 0, Math.PI * 2); x.fill();
-      x.fillStyle = '#2ee6ff';
-      x.beginPath(); x.arc(dx, dy, 7, 0, Math.PI * 2); x.fill();
+    const r = cv.getBoundingClientRect();
+    const size = cv.clientWidth;
+    const mx = (ev.clientX - r.left - cv.clientLeft) * cv.width / size;
+    const my = (ev.clientY - r.top - cv.clientTop) * cv.height / size;
+    const candidates = this.events.map(e => ({ name: e.name, target: e.pos }));
+    for (const region of this.world.guide) if (region.target) candidates.push(region);
+    let best = null, distance = 11;
+    for (const candidate of candidates) {
+      const { x, z } = candidate.target;
+      const [sx, sy] = this.mapView.project(x, z);
+      const d = Math.hypot(sx - mx, sy - my) * size / cv.width;
+      if (d < distance) { best = candidate; distance = d; }
     }
-    // 活动光柱点
-    for (const e of this.events) {
-      const [a, b] = this.bmFn(e.pos.x, e.pos.z);
-      x.fillStyle = `#${e.color.toString(16).padStart(6, '0')}`;
-      x.beginPath(); x.arc(a, b, 6, 0, Math.PI * 2); x.fill();
-      x.lineWidth = 2; x.strokeStyle = 'rgba(255,255,255,0.8)'; x.stroke();
-    }
-    // 待确认标记
-    if (this.bigPick) {
-      const [a, b] = this.bmFn(this.bigPick.x, this.bigPick.z);
-      x.strokeStyle = '#ff4d6a'; x.lineWidth = 3;
-      x.beginPath(); x.arc(a, b, 12, 0, Math.PI * 2); x.stroke();
-      x.beginPath(); x.arc(a, b, 4, 0, Math.PI * 2); x.fillStyle = '#ff4d6a'; x.fill();
-    }
-    // 玩家箭头
-    const [px2, py2] = this.bmFn(this.player.pos.x, this.player.pos.z);
-    x.save();
-    x.translate(px2, py2);
-    x.rotate(-this.player.yaw); // 地图北朝上：yaw 逆时针为正 → 屏幕顺时针取负
-    x.fillStyle = '#ff3344';
-    x.strokeStyle = '#ffffff'; x.lineWidth = 2;
-    x.beginPath();
-    x.moveTo(0, -13); x.lineTo(8, 9); x.lineTo(0, 4); x.lineTo(-8, 9);
-    x.closePath(); x.fill(); x.stroke();
-    x.restore();
-    // 北向 N
-    x.fillStyle = '#fff'; x.font = 'bold 22px sans-serif'; x.textAlign = 'center';
-    x.fillText('N', S - 34, 34);
+    const [wx, wz] = this.mapView.unproject(mx, my);
+    this.setMapPick(best?.target.x ?? wx, best?.target.z ?? wz, best?.name ?? '自定义目的地');
   }
+
+  drawBigMap() { this.mapView.drawBig(this); }
 
   setNavDest(pos, name) {
     this.closeBigMap();
@@ -822,7 +514,8 @@ export class Game {
       cum.push(cum[i - 1] + Math.hypot(full[i].x - full[i - 1].x, full[i].z - full[i - 1].z));
     }
     this.nav = { name, dest: new THREE.Vector3(pos.x, pos.y || 0, pos.z), pts: full, cum, cursor: 0, rerouteT: 0, fallback, hops };
-    this.navGuide.setRoute(full);
+    if (fallback) this.navGuide.clear();
+    else this.navGuide.setRoute(full);
   }
 
   clearNav() {
@@ -840,8 +533,8 @@ export class Game {
       box.style.display = 'none';
       return;
     }
-    this.navGuide.group.visible = true;
-    this.navGuide.update(dt);
+    this.navGuide.group.visible = !nv.fallback;
+    if (!nv.fallback) this.navGuide.update(dt);
     box.style.display = 'block';
 
     const p = this.player.pos;
@@ -1146,6 +839,7 @@ export class Game {
       }
       this._lastCnt = n;
       this.player.syncMesh();
+      this.drawMinimap();
       return 0;
     }
 
@@ -1434,15 +1128,44 @@ export class Game {
     // 暂停菜单（v2.19.2）
     $('btn-resume').onclick = () => this.togglePause();
     $('btn-pause-menu').onclick = () => this.toMenu();
-    // 大地图导航（v2.18）
-    $('bigMapCanvas').addEventListener('pointerdown', (e) => this.pickBigMap(e));
+    const mm = $('btn-minimap');
+    let press = null, startX, startY, skipClick = false;
+    const cancelPress = () => { clearTimeout(press); press = null; };
+    mm.addEventListener('pointerdown', e => {
+      if (!e.isPrimary || e.button !== 0) return;
+      skipClick = false; startX = e.clientX; startY = e.clientY;
+      cancelPress();
+      press = setTimeout(() => { skipClick = true; this.openBigMap(); }, 450);
+    });
+    mm.addEventListener('pointermove', e => {
+      if (press !== null && Math.hypot(e.clientX - startX, e.clientY - startY) > 10) {
+        skipClick = true; cancelPress();
+      }
+    });
+    for (const event of ['pointerup', 'pointercancel', 'pointerleave']) mm.addEventListener(event, cancelPress);
+    mm.addEventListener('contextmenu', e => e.preventDefault());
+    mm.onclick = e => {
+      if (skipClick && e.detail) { skipClick = false; return; }
+      this.mmZoomIdx = (this.mmZoomIdx + 1) % this.mmZooms.length;
+      mm.setAttribute('aria-label', `小地图：${this.mmZooms[this.mmZoomIdx].label}，点按切换范围`);
+      this.mapView.lastMini = -Infinity;
+      this.drawMinimap();
+      this.audio.beep(660, 0.08, 0.1);
+    };
+    $('btn-open-map').onclick = () => this.openBigMap();
+    for (const region of this.world.guide) if (region.target) {
+      const button = document.createElement('button');
+      button.textContent = region.name;
+      button.onclick = () => this.setMapPick(region.target.x, region.target.z, region.name);
+      $('bm-regions').appendChild(button);
+    }
+    $('bigMapCanvas').addEventListener('pointerdown', e => { if (e.isPrimary && e.button === 0) this.pickBigMap(e); });
     $('btn-nav-go').onclick = () => {
       if (!this.bigPick) return;
       this.setNavDest(
         new THREE.Vector3(this.bigPick.x, 0, this.bigPick.z),
         this.bigPick.name
       );
-      this.closeBigMap();
     };
     $('btn-bigmap-close').onclick = () => this.closeBigMap();
     $('btn-nav-cancel-route').onclick = () => {
@@ -1452,7 +1175,14 @@ export class Game {
     };
     // 键盘 E 快捷报名
     window.addEventListener('keydown', (e) => {
-      if (e.key.toLowerCase() === 'e' && this.promptEvent) this.acceptEvent();
+      if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if ($('bigMap').style.display !== 'none') {
+        if (key === 'm') this.closeBigMap();
+        return;
+      }
+      if (key === 'm') this.openBigMap();
+      if (key === 'e' && this.state === 'running' && this.promptEvent) this.acceptEvent();
     });
   }
 }

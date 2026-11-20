@@ -46,7 +46,7 @@
       <button id="btn-quality">特效: 高</button>
       <button id="btn-sound">声音: 开</button>
     </div>
-    <p class="hint">电脑：WASD/方向键驾驶，空格手刹，Esc 暂停<br>手机：陀螺仪倾斜转向，左手刹车（左下），右手油门（右下，AUTO 为定速巡航：锁当前速度，油门/刹车可接管）<br>短按小地图切缩放，长按小地图打开世界地图：点选任意位置开始 🧭 导航</p>
+    <p class="hint">电脑：WASD/方向键驾驶，空格手刹，Esc 暂停，M 打开地图<br>手机：方向键或陀螺仪转向，AUTO 锁定当前速度，油门和刹车可临时接管<br>短按小地图切换范围，长按或点「地图」选择目的地</p>
   </div>
 
   <!-- HUD -->
@@ -65,13 +65,22 @@
         <div class="row" id="best-line">纪录 <b id="best-val">--</b></div>
       </div>
     </div>
-    <canvas id="minimap" width="150" height="150"></canvas>
-    <button id="btn-pause">⏸</button>
+    <div id="map-hud">
+      <button id="btn-open-map" type="button" aria-haspopup="dialog" aria-label="打开世界地图，快捷键 M">◇ 地图</button>
+      <button id="btn-pause" type="button" aria-label="暂停">⏸</button>
+      <button id="btn-minimap" type="button" aria-label="小地图：自动，点按切换范围" title="点按缩放，长按打开世界地图">
+        <canvas id="minimap" width="150" height="150"></canvas>
+      </button>
+    </div>
   </div>
 
   <!-- 手机触屏按键 -->
   <div id="controls" style="display:none">
     <div class="cluster left">
+      <div class="touch-steering" aria-label="触屏转向">
+        <button class="ctl turn" id="btn-steer-left" aria-label="左转">◀</button>
+        <button class="ctl turn" id="btn-steer-right" aria-label="右转">▶</button>
+      </div>
       <button class="ctl brake" id="btn-brake">BRAKE</button>
     </div>
     <div class="cluster right">
@@ -135,16 +144,24 @@
     </div>
   </div>
 
-  <!-- 大地图导航（长按小地图打开，v2.18：点选任意位置设目的地） -->
-  <div id="bigMap" style="display:none">
-    <div class="bm-title" id="bm-title">🧭 世界地图 · 点选目的地</div>
-    <canvas id="bigMapCanvas" width="1024" height="1024"></canvas>
-    <div id="bm-hint">点选地图任意位置作为目的地</div>
-    <div class="bm-actions">
-      <button id="btn-nav-cancel-route">✕ 取消导航</button>
-      <button id="btn-nav-go" disabled>🧭 开始导航</button>
-      <button id="btn-bigmap-close">关闭</button>
-    </div>
+  <!-- 世界地图 / 路线预览 -->
+  <div id="bigMap" role="dialog" aria-modal="true" aria-labelledby="bm-title" style="display:none">
+    <canvas id="bigMapCanvas" width="1024" height="1024" aria-label="世界地图，点击选择目的地"></canvas>
+    <section class="bm-panel">
+      <div class="bm-eyebrow">NEON RUSH / ATLAS</div>
+      <h2 id="bm-title">世界地图</h2>
+      <div class="bm-legend" aria-label="地图图例">
+        <span><i class="bm-highway"></i>高速</span><span><i class="bm-road"></i>铺装</span>
+        <span><i class="bm-dirt"></i>土路</span><span><i class="bm-event"></i>赛事</span>
+      </div>
+      <div id="bm-regions" aria-label="区域目的地"></div>
+      <div id="bm-hint" aria-live="polite">点地图或选择区域；确认后开始导航。</div>
+      <div class="bm-actions">
+        <button id="btn-nav-go" disabled>开始导航</button>
+        <button id="btn-bigmap-close">关闭</button>
+        <button id="btn-nav-cancel-route">取消当前导航</button>
+      </div>
+    </section>
   </div>
 
   <!-- 提示 toast -->

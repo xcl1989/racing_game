@@ -4,6 +4,7 @@ import { createRoadMaterial } from './roads.js';
 import { buildNorthInterchange } from './north-interchange.js';
 import { addShowcaseCorridor } from './route-detail.js';
 import { boxBatch } from './scene-detail.js';
+import { LAKE, FOOTHILL_LAKE, RIVER, worldGuide, addWorldSigns } from './world-guide.js';
 import {
   makeAsphaltTextures, makeLaneTextures, makeHighwayTextures, makeJunctionTextures,
   makeGrassTexture, makeWaterNormal, makeDirtTextures,
@@ -287,7 +288,6 @@ export function buildWorld(scene) {
   // ---- 高速连接大道：城市 ↔ 高速的匝道风格直线接入 ----
   // 动态采样高速样条找最近点；端点伸过高速中线 4m 保证无缝衔接且不戳出对侧
   // ⚠️ 高度 0.04：高于高速(0.02)/横街(0.026)，重叠区高差足够防远距 Z-fighting
-  const extraRoadPolys = [];
   const Y_CONN = 0.04;
   function nearestCurvePoint(curve, tx, tz, filter) {
     let bp = null, bd = Infinity;
@@ -358,7 +358,6 @@ export function buildWorld(scene) {
   }
   const roundabout = ribbon(roundPts, true, 8, { color: 0x9a9184, roughness: 1 });
   group.add(roundabout.mesh);
-  extraRoadPolys.push(lakeRoadPts.map((p) => [p.x, p.z]), [...roundPts, roundPts[0]].map((p) => [p.x, p.z]));
 
   // ---- 地标电视塔（城市东北天际线，观测舱 + 天线）----
   {
@@ -410,7 +409,6 @@ export function buildWorld(scene) {
   ];
   const national = ribbon(natPts, false, 12, { roughness: 0.88 });
   group.add(national.mesh);
-  extraRoadPolys.push(natPts.map((p) => [p.x, p.z]));
 
   // ---- 程序化山体（北海道纳尔）+ 盘山公路 + 山顶环岛 ----
   // 地形 = 解析高度场：terrainH 同时供路面取样、车物理 heightAt、山体网格、植被贴地
@@ -449,12 +447,12 @@ export function buildWorld(scene) {
   function terrainH(x, z) {
     let h = mountainH(x, z);
     // 河道（纵贯 x=-900，z ±1700 端部渐隐成旱沟尾；坡度收紧让下切读得出来）
-    const zf = Math.max(0, Math.min(1, (1700 - Math.abs(z)) / 120));
-    h += cutBand(Math.abs(x + 900), 20, 60, 2.2) * zf;
+    const zf = Math.max(0, Math.min(1, (RIVER.halfLength - Math.abs(z)) / 120));
+    h += cutBand(Math.abs(x - RIVER.x), 20, 60, 2.2) * zf;
     // 湖1（湖东野径贴岸：盆缘 132-152 缓坡——坡带必须远宽于 43m 地面网格间距，否则插值岸坡错位）
-    h += cutRadial(x, z, 660, -560, 132, 152, 1.7);
+    h += cutRadial(x, z, LAKE.x, LAKE.z, 132, 152, 1.7);
     // 湖2（山脚湖）
-    h += cutRadial(x, z, -1500, -1900, 176, 215, 1.8);
+    h += cutRadial(x, z, FOOTHILL_LAKE.x, FOOTHILL_LAKE.z, 176, 215, 1.8);
     return h;
   }
 
@@ -591,7 +589,6 @@ export function buildWorld(scene) {
   }
   const mountainRoad = ribbon(mRoadPts, false, 9, { roughness: 0.95, follow: 0.1, segLen: 3 });
   group.add(mountainRoad.mesh);
-  extraRoadPolys.push(mRoadPts.map((p) => [p.x, p.z]));
   // 山顶环岛（v2.28: follow=0.2 —— 高于盘山路 0.1 防共面；山顶平台已压平 → 全环等高）
   const summitPts = [];
   for (let i = 0; i < 12; i++) {
@@ -601,7 +598,6 @@ export function buildWorld(scene) {
   }
   const summitRing = ribbon(summitPts, true, 9, { roughness: 0.95, follow: 0.2 });
   group.add(summitRing.mesh);
-  extraRoadPolys.push([...summitPts, summitPts[0]].map((p) => [p.x, p.z]));
 
   // ---- 乡间小道：西部闭环（垂直跨河的正经桥）----
   // ⚠️ 布局原则：
@@ -610,7 +606,7 @@ export function buildWorld(scene) {
   //   2. 桥沿 X 轴垂直跨河：引道加密集过渡点压制 CatmullRom 过冲
   //      —— 旧版 4 点悬空过桥被样条织成 S 形"水上漂"
   const Y_COUNTRY = 0.02;
-  const RIVER_X = -900, RIVER_W = 90;
+  const RIVER_X = RIVER.x;
   const cPts = [
     new THREE.Vector3(-560, Y_COUNTRY, 30),    // 东引道起点
     new THREE.Vector3(-700, Y_COUNTRY, 48),
@@ -647,7 +643,6 @@ export function buildWorld(scene) {
     true, 4.5, { roughness: 1, follow: 0.05, minY: -5 }, 3
   );
   group.add(trail.mesh);
-  extraRoadPolys.push([...trailPts, trailPts[0]].map(([x, z]) => [x, z]));
 
   // ---- 湖西环路（v2.13）：高速南段 ↔ 湖滨环岛，绕湖西形成环湖通路西半环 ----
   // ⚠️ 贴地形铺路（sampleTerrain+0.05）：南段穿过湖盆坡带外缘，固定 y 会悬空
@@ -708,10 +703,10 @@ export function buildWorld(scene) {
   const riverNormal = makeWaterNormal();
   riverNormal.repeat.set(9, 404); // ~8.4m/格
   const river = new THREE.Mesh(
-    new THREE.PlaneGeometry(76, 3400, 8, 420),
+    new THREE.PlaneGeometry(76, RIVER.halfLength * 2, 8, 420),
     makeWaterMaterial({
       deep: 0x114f78, shallow: 0x2a7a8a, glint: 1.0,
-      shoreMode: 'band', center: [RIVER_X, 0], shoreR: 34.4,
+      shoreMode: 'band', center: [RIVER_X, 0], shoreR: RIVER.halfWidth,
       band: 9, foamBand: 2.5, waveAmp: 0.042,
       normalTex: riverNormal, normalScale: 0.55, repeat: 9,
     })
@@ -728,13 +723,13 @@ export function buildWorld(scene) {
     new THREE.PlaneGeometry(430, 430, 64, 64),
     makeWaterMaterial({
       deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.9,
-      shoreMode: 'circle', center: [-1500, -1900], shoreR: 186,
+      shoreMode: 'circle', center: [FOOTHILL_LAKE.x, FOOTHILL_LAKE.z], shoreR: FOOTHILL_LAKE.r,
       band: 28, foamBand: 3.5, waveAmp: 0.07,
       normalTex: lake2Normal, normalScale: 0.4, repeat: 27,
     })
   );
   lake2.rotation.x = -Math.PI / 2;
-  lake2.position.set(-1500, -1.5, -1900);
+  lake2.position.set(FOOTHILL_LAKE.x, -1.5, FOOTHILL_LAKE.z);
   group.add(lake2);
 
   // ---- 城市楼房 + 街区公园 ----
@@ -1214,21 +1209,19 @@ export function buildWorld(scene) {
     sprintRoutes.offroad = routeFromPoints(pts, 7, 'offroad_stampede');
   }
 
-  // 小地图折线（画全路网）：高速 / 乡道 + 城市街道网格逐条补上
-  // ⚠️ 旧版只有 3 条折线，站在城市十字路口地图上空空如也
-  // NPC 曲线只是街道上的行车路径；地图只绘制实际道路。
-  const streetPolys = cityStreets.map((s) => [[s.ax, s.az], [s.bx, s.bz]]);
-  const minimapPolylines = [
-    highway.samples.map(({pos}) => [pos.x, pos.z]),
-    [...cPts, cPts[0]].map((p) => [p.x, p.z]),
-    ...streetPolys,
-    ...extraRoadPolys,
-    eastConnPts.map((p) => [p.x, p.z]),
-    southConnPts.map((p) => [p.x, p.z]),
-    ...northInterchange.minimap,
-    westLakePts.map((p) => [p.x, p.z]),
-    swLinkPts.map((p) => [p.x, p.z]),
-  ];
+  const lines = (...routes) => routes.map(route => route.samples.map(({ pos }) => [pos.x, pos.z]));
+  const mapRoads = {
+    highway: lines(highway),
+    arterial: lines(national, eastConnRoad, southConnRoad, swLinkRoad),
+    ramps: northInterchange.minimap,
+    local: [...cityStreets.map(s => [[s.ax, s.az], [s.bx, s.bz]]),
+      ...lines(lakeRoad, westLakeRoad, roundabout, mountainRoad, summitRing)],
+    dirt: lines(country, trail),
+    bridge: lines(country).map(line => line.filter(([x, z]) => Math.abs(x - RIVER.x) <= 40 && Math.abs(z - 61) < 10)),
+  };
+  const guide = worldGuide({ MT, northInterchange, national, country, lakeRoad, westLakeRoad, mountainRoad });
+  addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 &&
+    !bldColliders.some(b => Math.abs(x - b.x) < b.hw + .8 && Math.abs(z - b.z) < b.hd + .8));
 
   addShowcaseCorridor(group, { highway, country, westLakeRoad, bldColliders, groundSampler, onAnyRoad });
 
@@ -1248,6 +1241,6 @@ export function buildWorld(scene) {
     lights, update, isRed,
     heightAt, isOnCityRoad, distToCityRoads,
     onAnyRoad, surfaceAt, distToRoads,
-    minimapPolylines,
+    mapRoads, guide,
   };
 }

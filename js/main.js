@@ -14,6 +14,7 @@ import { makeGlowTexture, makeCloudTexture, createSkyPainter } from './textures.
 import { createWeather } from './weather.js';
 import { createOutdoorEnvironment, SUN_DIRECTION, SUN_OFFSET } from './environment.js';
 import { CAR_SPECS } from './cars.js';
+import { damp, angleDelta } from './steering.js';
 import { SaveManager } from './save.js'; // v2.32 存档管理（3 槽位 localStorage）
 
 const $ = (id) => document.getElementById(id);
@@ -792,10 +793,13 @@ const look = { yaw: 0, pitch: 0, dragging: false, id: -1, lastX: 0, lastY: 0 };
 const camTarget = new THREE.Vector3();
 const camGoal = new THREE.Vector3();
 const FWD = new THREE.Vector3();
+const aim = new THREE.Vector3();
+let chaseYaw = null;
 let showroomOrbit = 0; // 展厅慢速自转角（拖拽经 look.yaw 叠加）
 function updateCamera(dt, shake) {
   // v2.14 展厅模式：车库内环绕展台车模（拖拽 look.yaw/pitch 叠加，松手不回正）
   if (showroom) {
+    chaseYaw = null;
     showroomOrbit += dt * 0.25;
     const a = showroomOrbit + look.yaw;
     // 竖屏自适应：窄视野拉远相机防车模溢出裁切，同时压低目标高度让车居中偏上
@@ -820,22 +824,28 @@ function updateCamera(dt, shake) {
     look.yaw *= Math.exp(-dt * 2.2);
     look.pitch *= Math.exp(-dt * 2.2);
   }
-  FWD.set(Math.sin(player.yaw + look.yaw), 0, Math.cos(player.yaw + look.yaw));
-  const sk = Math.min(1, Math.abs(player.speed) / 47);
-  // 高速时相机拉远拉高，增强速度感；纵滑抬高/压低视角
-  camGoal.copy(player.pos).addScaledVector(FWD, -(9.5 + sk * 2.5))
-    .add({ x: 0, y: Math.max(1.2, 4.2 + sk * 0.6 + look.pitch * 9), z: 0 });
-  const k = 1 - Math.exp(-dt * 7); // v2.30：5→7，跟车更紧，转向不再"镜头甩半拍"
+  const sk = Math.min(1, Math.abs(player.speed) / 53);
+  const portrait = camera.aspect < .95;
+  const snap = chaseYaw === null || camera.position.distanceToSquared(player.pos) > 52 ** 2;
+  chaseYaw = snap ? player.yaw : chaseYaw + damp(0, angleDelta(chaseYaw, player.yaw), dt, 8);
+  const tailYaw = chaseYaw + look.yaw;
+  const lead = Math.max(-.16, Math.min(.16, player.yawRate * .13)) * Math.min(1, Math.max(0, player.speed / 10));
+  const aimYaw = tailYaw + lead;
+  FWD.set(Math.sin(tailYaw), 0, Math.cos(tailYaw));
+  aim.set(Math.sin(aimYaw), 0, Math.cos(aimYaw));
+  camGoal.copy(player.pos).addScaledVector(FWD, -(8.9 + sk * 2.6 + (portrait ? 1.65 : 0)));
+  camGoal.y += Math.max(1.15, 3.65 + sk * .65 + (portrait ? .35 : 0) + look.pitch * 9);
+  const k = snap ? 1 : 1 - Math.exp(-dt * 8);
   camera.position.lerp(camGoal, k);
-  if (shake > 0) {
-    camera.position.x += (Math.random() - 0.5) * shake * 0.35;
-    camera.position.y += (Math.random() - 0.5) * shake * 0.25;
+  const impact = Math.max(0, shake - .15) * .52;
+  if (impact > 0) {
+    camera.position.x += (Math.random() - .5) * impact * .32;
+    camera.position.y += (Math.random() - .5) * impact * .21;
   }
-  // 前瞻点随速度前移：高速看得更远（固定 7m 在 200km/h 下几乎贴着车头）
-  camTarget.copy(player.pos).addScaledVector(FWD, 6 + sk * 6).add({ x: 0, y: 1.6 + look.pitch * 2, z: 0 });
+  camTarget.copy(player.pos).addScaledVector(aim, 5.8 + sk * 9.2);
+  camTarget.y += 1.48 + look.pitch * 2;
   camera.lookAt(camTarget);
-  camera.rotateZ(player.driftYaw * 0.6);          // 过弯侧倾
-  camera.fov += (60 + sk * 12 - camera.fov) * k;  // v2.30：62+16→60+12，高速 FOV 78→72 减畸变
+  camera.fov = damp(camera.fov, 59 + sk * 10 + (portrait ? 3 : 0), dt, 5);
   camera.updateProjectionMatrix();
   // 阴影相机跟随玩家
   sun.position.copy(player.pos).add(SUN_OFFSET);
@@ -851,7 +861,6 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   pollInput(); // 每帧轮询输入：AUTO 油门/陀螺仪不依赖事件即可生效
   const shake = game.update(dt, input);
-  game.drawBigMap(); // 大地图动态层（打开地图=暂停，update 早退也要刷新标记/路线）
   updateCamera(dt, shake);
   sunSprite.position.copy(camera.position).addScaledVector(SUN_DIRECTION, 1700);
   weather.update(dt, camera.position); // 天气：天穹/光照/雾/雨粒子/湿滑
