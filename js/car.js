@@ -448,8 +448,6 @@ export class PlayerCar {
     this.yawRate = 0;
     this.throttleSm = 0;   // 平滑后的油门
     this.hint = -1;        // 赛道最近样条提示
-    this.trackT = 0;       // 归一化赛道进度 0..1
-    this.total = 0;        // 总进度（圈数 + t），用于排名
     this.offroad = false;
   }
 
@@ -476,7 +474,7 @@ export class PlayerCar {
   reset(pos, yaw) {
     this.pos.copy(pos); this.yaw = yaw; this.speed = 0;
     this.travelYaw = yaw; this.slip = 0;
-    this.driftYaw = 0; this.total = 0;
+    this.driftYaw = 0; this.hint = -1;
     this.steerSm = this.throttleSm = this.yawRate = 0;
     this.bodyRoll = this.bodyPitch = 0;
     for (const w of this.wheels) if (w.steer) {
@@ -584,14 +582,6 @@ export class PlayerCar {
       }
     }
 
-    // 赛道进度
-    const { i } = track.nearestSample(this.pos, this.hint);
-    const prevT = this.trackT;
-    this.trackT = i / track.samples.length;
-    if (this.trackT < 0.2 && prevT > 0.8) this.total += 1 - prevT + this.trackT; // 过起点
-    else this.total += this.trackT - prevT;
-    this.hint = i;
-
     // 车轮滚动 + 前轮转向（wheels 为每轮一组：组内所有部件一起滚/转）
     // 滚动方向：车头 +Z 前进 → 轮角速度沿 +X（ω=v/R>0），rotation.x 必须递增
     // （-= 会让轮顶向车尾、观感倒车——v2.9.1 用户实测确认）
@@ -629,7 +619,7 @@ export class PlayerCar {
   }
 }
 
-// ---- AI 车：起步反应 + 加减速 + 弯道判弯 + 橡皮筋追赶 ----
+// ---- AI 车：弯速预估、相邻车道超车和交通巡航 ----
 // env = 任何有 {curve, length} 的路线（环道 / 高速 / 城市 / 乡道），dir=±1 双向行驶
 export class AICar {
   constructor(color, lane, baseSpeed, template = null, route = null, dir = 1, startT = 0) {
@@ -657,123 +647,118 @@ export class AICar {
     }
   }
 
-  reset(track) {
-    this.total = 0;
+  resetRace(env, distance, lane, pace) {
+    this.total = distance;
+    this.lane = this.raceLane = this.targetLane = lane;
     this.speed = 0;
-    this.reaction = 0.4 + Math.random() * 0.7;
-    this.place(track);
+    this.finishTime = null;
+    this.reaction = pace.reaction;
+    this.racePace = pace;
+    this.placeAt(env, this.total, lane);
   }
 
-  // 比赛车（环道，含橡皮筋）
-  update(dt, track, playerTotal) {
-    if (this.reaction > 0) {
-      this.reaction -= dt;
-      this.place(track, 0);
+  updateRace(dt, env, rivals, wet, elapsed, finish) {
+    const p = this.racePace;
+    if (this.finishTime != null) {
+      const room = Math.max(0, (env.closed ? finish + 45 : env.length) - this.total);
+      this.adjustSpeed(Math.min(p.speed, Math.sqrt(room * 14)), p.accel, 20, dt);
+      const step = Math.min(room, this.speed * dt);
+      this.total += step;
+      this.placeAt(env, this.total, this.lane, step / 0.37);
       return;
     }
-    const gap = playerTotal - this.total;
-    const rubber = Math.max(-4, Math.min(6, gap * 20));
-
-    const t = ((this.total / track.length) % 1 + 1) % 1;
-    const tan1 = track.curve.getTangentAt(t);
-    const tan2 = track.curve.getTangentAt((t + 0.012) % 1);
-    const ang = tan1.angleTo(tan2);
-    const corner = Math.max(0.45, 1 - ang * 14);
-    const target = Math.max(8, (this.baseSpeed + rubber) * corner);
-
-    const accel = 11, decel = 22;
-    if (this.speed < target) this.speed = Math.min(target, this.speed + accel * dt);
-    else this.speed = Math.max(target, this.speed - decel * dt);
-
-    this.total += this.speed * dt;
-    this.place(track, this.speed * dt / 0.37);
+    if (this.reaction > 0) { this.reaction -= dt; return; }
+    const half = Math.max(0, (env.width ?? 14) / 2 - 1.4);
+    const gapOf = (rival) => {
+      const d = rival.total - this.total;
+      return env.closed ? d - Math.round(d / env.length) * env.length : d;
+    };
+    const free = (lane) => rivals.every(other => {
+      const gap = gapOf(other);
+      return gap < -8 || gap > 15 || Math.abs(other.lane - lane) >= 2.65;
+    });
+    let target = Math.min(p.speed, p.limit(this.total, wet));
+    const leader = rivals.filter(other => {
+      const gap = gapOf(other);
+      return gap > 0 && gap < 28 && Math.abs(other.lane - this.lane) < 2.65;
+    }).sort((a, b) => gapOf(a) - gapOf(b))[0];
+    // Finish the lane change before reconsidering the preferred line.
+    if (Math.abs(this.targetLane - this.lane) < 0.08) {
+      if (leader && p.speed > leader.speed + 1) {
+        const candidate = [this.raceLane, -half, half, 0].find(lane => Math.abs(lane - this.lane) > 1.65 && free(lane));
+        if (candidate !== undefined) this.targetLane = candidate;
+      } else if (!leader && free(this.raceLane)) this.targetLane = this.raceLane;
+    }
+    const lateral = Math.max(-1.9 * dt, Math.min(1.9 * dt, this.targetLane - this.lane));
+    const nextLane = this.lane + lateral;
+    if (rivals.every(other => Math.abs(gapOf(other)) > 5.2 || Math.abs(nextLane - other.lane) >= 2.3 ||
+      Math.abs(nextLane - other.lane) > Math.abs(this.lane - other.lane))) this.lane = nextLane;
+    for (const rival of rivals) {
+      const gap = gapOf(rival);
+      if (gap <= 0 || gap > 28 || Math.min(Math.abs(rival.lane - this.lane), Math.abs(rival.lane - this.targetLane)) >= 2.55) continue;
+      const stopped = gap < 5.5;
+      target = Math.min(target, stopped ? Math.max(0, rival.speed - 2) :
+        Math.sqrt(Math.max(0, rival.speed) ** 2 + 12 * Math.max(0, gap - 6 - this.speed * 0.22)));
+    }
+    const prev = this.total;
+    this.adjustSpeed(target, p.accel, 13, dt);
+    const step = this.speed * dt;
+    this.total = Math.min(finish, this.total + step);
+    if (this.total >= finish) this.finishTime = elapsed - dt + dt * (finish - prev) / Math.max(step, 1e-6);
+    this.placeAt(env, this.total, this.lane, step / 0.37);
   }
 
-  // NPC 车流（固定路线巡航；hold=true = 红灯停车）
-  updateTraffic(dt, env, hold = false) {
-    if (this.reaction > 0) {
-      this.reaction -= dt;
-      this.placeOn(env, 0);
-      return;
+  adjustSpeed(target, accel, decel, dt) {
+    this.speed = this.speed < target ? Math.min(target, this.speed + accel * dt) : Math.max(target, this.speed - decel * dt);
+  }
+
+  updateTraffic(dt, env) {
+    if (this.reaction > 0) { this.reaction -= dt; return; }
+    const len = env.length;
+    const phase = env.closed ? ((this.total / len) % 1 + 1) % 1 : this.total / len;
+    let target = Math.min(this.trafficTarget ?? Infinity, env.speedAt?.(phase, this.baseSpeed) ?? this.baseSpeed);
+    // Open-road patrols make a low-speed U-turn short of the connector.
+    if (!env.closed) {
+      const radius = Math.abs(this.lane);
+      if (this.turn) {
+        const oldT = this.turn.t, t = Math.min(1, oldT + dt / 2.4);
+        const angle = Math.PI * t;
+        this.turn.t = t;
+        this.placeAt(env, this.total + this.dir * radius * Math.sin(angle),
+          this.lane * this.dir * Math.cos(angle), radius * Math.PI * (t - oldT) / 0.37);
+        this.yaw += (this.dir === 1 ? 0 : Math.PI) - Math.sign(this.lane || -1) * angle;
+        this.group.rotation.y = this.yaw;
+        if (t === 1) { this.dir *= -1; this.turn = null; }
+        return;
+      }
+      const room = (this.dir > 0 ? len - this.total : this.total) - radius - 1;
+      if (room <= 0.35 && this.speed < 1.5) {
+        this.speed = 0;
+        this.turn = { t: 0 };
+        return;
+      }
+      target = Math.min(target, Math.sqrt(7 * Math.max(0, room - 0.18)));
     }
-    const phase = ((this.total / env.length) % 1 + 1) % 1;
-    const target = hold ? 0 : (env.speedAt?.(phase, this.baseSpeed) ?? this.baseSpeed);
-    const accel = 7, decel = 16;
-    if (this.speed < target) this.speed = Math.min(target, this.speed + accel * dt);
-    else this.speed = Math.max(target, this.speed - decel * dt);
-    if (hold && this.speed < 0.05) { this.placeOn(env, 0); return; }
+    this.adjustSpeed(target, 4.5, 11, dt);
     this.total += this.speed * dt * this.dir;
-    this.placeOn(env, Math.abs(this.speed) * dt / 0.37);
-  }
-
-  place(track, spin = 0) {
-    const t = ((this.total / track.length) % 1 + 1) % 1;
-    const p = track.curve.getPointAt(t);
-    const tan = track.curve.getTangentAt(t).setY(0).normalize();
-    this._side.set(tan.z, 0, -tan.x);
-    this.pos.copy(p).addScaledVector(this._side, this.lane);
-    this.pos.y = p.y;
-    this.yaw = Math.atan2(tan.x, tan.z);
-    this.group.position.copy(this.pos);
-    this.group.rotation.y = this.yaw;
-    for (const w of this.wheels) for (const m of w.meshes) m.rotation.x += spin;
+    if (!env.closed) this.total = Math.max(0, Math.min(len, this.total));
+    this.placeOn(env, this.speed * dt / 0.37);
   }
 
   placeOn(env, spin = 0) {
-    const len = env.length;
-    const t = ((this.total / len) % 1 + 1) % 1;
-    const p = env.curve.getPointAt(t);
-    const tan = env.curve.getTangentAt(t).setY(0).normalize();
-    this._side.set(tan.z, 0, -tan.x).multiplyScalar(this.dir);
-    this.pos.copy(p).addScaledVector(this._side, this.lane);
-    this.pos.y = p.y;
-    this.yaw = Math.atan2(tan.x * this.dir, tan.z * this.dir);
-    this.group.position.copy(this.pos);
-    this.group.rotation.y = this.yaw;
-    for (const w of this.wheels) for (const m of w.meshes) m.rotation.x += spin;
+    this.placeAt(env, this.total, this.lane * this.dir, spin, this.dir);
   }
 
-  // ---- v2.32 冲刺/越野赛（单向路线）：不回绕，冲线后停住 ----
-  resetSprint(env, lane = this.lane) {
-    this.lane = lane;
-    this.total = 0;
-    this.speed = 0;
-    this.finished = false;
-    this.finishTime = null;
-    this.reaction = 0.4 + Math.random() * 0.7;
-    this.placeRoute(env);
-  }
-
-  placeRoute(env, spin = 0) {
-    const t = Math.max(0, Math.min(0.9999, this.total / env.length));
-    const p = env.curve.getPointAt(t);
+  placeAt(env, distance, lateral, spin = 0, dir = 1) {
+    const ratio = distance / env.length;
+    const t = env.closed ? ((ratio % 1) + 1) % 1 : Math.max(0, Math.min(1, ratio));
+    const pos = env.curve.getPointAt(t);
     const tan = env.curve.getTangentAt(t).setY(0).normalize();
     this._side.set(tan.z, 0, -tan.x);
-    this.pos.copy(p).addScaledVector(this._side, this.lane);
-    this.pos.y = p.y;
-    this.yaw = Math.atan2(tan.x, tan.z);
+    this.pos.copy(pos).addScaledVector(this._side, lateral);
+    this.yaw = Math.atan2(tan.x * dir, tan.z * dir);
     this.group.position.copy(this.pos);
     this.group.rotation.y = this.yaw;
     for (const w of this.wheels) for (const m of w.meshes) m.rotation.x += spin;
-  }
-
-  // 单向路线版比赛车：橡皮筋 + 弯道判弯同环道，但 total 沿曲线长度单调增长
-  updateSprint(dt, env, playerTotal) {
-    if (this.finished) { this.placeRoute(env); return; }
-    if (this.reaction > 0) { this.reaction -= dt; this.placeRoute(env); return; }
-    const gap = playerTotal - this.total;
-    const rubber = Math.max(-4, Math.min(6, gap * 20));
-    // 前方 0.012 曲线长的切向夹角判弯（t 钳在 [0,1) 防终点外取切线）
-    const t0 = Math.min(0.999, this.total / env.length);
-    const t1 = Math.min(1, t0 + 0.012);
-    const ang = env.curve.getTangentAt(t0).angleTo(env.curve.getTangentAt(t1));
-    const corner = Math.max(0.45, 1 - ang * 14);
-    const target = Math.max(8, (this.baseSpeed + rubber) * corner);
-    const accel = 11, decel = 22;
-    if (this.speed < target) this.speed = Math.min(target, this.speed + accel * dt);
-    else this.speed = Math.max(target, this.speed - decel * dt);
-    this.total = Math.min(env.length, this.total + this.speed * dt);
-    if (this.total >= env.length - 0.5) this.finished = true;
-    this.placeRoute(env, this.speed * dt / 0.37);
   }
 }

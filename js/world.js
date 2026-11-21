@@ -1,6 +1,7 @@
 // world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线 / 国道 / 盘山公路
 import * as THREE from 'three';
 import { createRoadMaterial } from './roads.js';
+import { buildRoadIndex, roadOverlapsBox } from './road-network.js';
 import { buildNorthInterchange } from './north-interchange.js';
 import { addShowcaseCorridor } from './route-detail.js';
 import { boxBatch } from './scene-detail.js';
@@ -23,7 +24,7 @@ const kerbJobs = [];      // {id, cv, quadCenters, group}
 const ribbonRegistry = []; // {id, samples, width, tex}
 function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   const id = ribbonRegistry.length;
-  const curve = new THREE.CatmullRomCurve3(pts, closed, 'catmullrom', 0.5);
+  const curve = new THREE.CatmullRomCurve3(pts, closed, matOpts.curveType ?? 'catmullrom', 0.5);
   // v2.28b: segLen 可调采样密度（默认 8m）。山地 follow 路必须细于地形网格（21m）——
   // 粗弦线在凸形路段会被地形三角刺穿（凸包差 >0.1m 抬升），细到 3m 弦线即面内精确细化
   const SEG = Math.max(64, Math.floor(curve.getLength() / (matOpts.segLen ?? 8)));
@@ -66,7 +67,7 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   g.computeVertexNormals();
   // v2.21：贴图工厂已单例化（make*Textures 内部缓存），直接共享实例不再 clone
   //（repeat 恒 (1,1)，旧 clone 是每路独立 GPU 纹理 —— 1024px 时代共享反而省 20 份显存）
-  const { follow, minY, segLen, curb = true, ...surfaceOptions } = matOpts;
+  const { follow, minY, segLen, curveType, curb = true, ...surfaceOptions } = matOpts;
   const mat = createRoadMaterial(tex === 3 ? 'dirt' : 'asphalt', {
     map: asphalt.map, normalMap: asphalt.normal, roughnessMap: asphalt.roughness ?? null,
     normalScale: new THREE.Vector2(0.7, 0.7), ...surfaceOptions,
@@ -136,7 +137,7 @@ function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
   } else {
     mesh = roadMesh;
   }
-  return { mesh, curve, samples, length: curve.getLength() };
+  return { mesh, curve, samples, closed, length: curve.getLength(), deck: verts };
 }
 
 // v2.33 缘石统一挂接：全部路建完后执行。与其他路面交叉的缘石条带自动剔除——
@@ -283,7 +284,9 @@ export function buildWorld(scene) {
     trafficCurve.add(new THREE.LineCurve3(approach(before, corner), approach(corner, before)));
     trafficCurve.add(new THREE.QuadraticBezierCurve3(approach(corner, before), corner, approach(corner, after)));
   }
-  const cityRoute = { curve: trafficCurve, length: trafficCurve.getLength() };
+  trafficCurve.getPointAt = (t) => trafficCurve.getPoint(t);
+  trafficCurve.getTangentAt = (t) => trafficCurve.getTangent(t);
+  const cityRoute = { curve: trafficCurve, closed: true, length: trafficCurve.getLength() };
 
   // ---- 高速连接大道：城市 ↔ 高速的匝道风格直线接入 ----
   // 动态采样高速样条找最近点；端点伸过高速中线 4m 保证无缝衔接且不戳出对侧
@@ -308,7 +311,7 @@ export function buildWorld(scene) {
       new THREE.Vector3(hp.x - 22, Y_CONN, hp.z),
       new THREE.Vector3(hp.x - 4, Y_CONN, hp.z),
     ];
-    const eastConn = ribbon(eastPts, false, 14, { roughness: 0.9 });
+    const eastConn = ribbon(eastPts, false, 14, { roughness: 0.9, curveType: 'centripetal' });
     group.add(eastConn.mesh);
     eastConnPts = eastPts; eastConnRoad = eastConn;
   }
@@ -632,11 +635,11 @@ export function buildWorld(scene) {
   //    旧版 max(0.044,…) 让路面悬空 0.6~1.1m、车整台陷进路面以下（巡检 audit_03 实锤）。
   //    地形本身高于水面 → 直接贴地即可，路面始终在水面之上。
   const trailPts = [
-    [846, -420], [838, -480], [828, -540], [820, -610], [796, -668],
+    [839, -420], [838, -480], [828, -540], [820, -610], [796, -668],
     [752, -700], [690, -714], [628, -706], [566, -686], [524, -650],
     [500, -600], [496, -556], [498, -505], [494, -470], [520, -448],
     [556, -448], [600, -424], [660, -415], [700, -420], [752, -446],
-    [800, -464], [836, -458], [846, -426],
+    [800, -464], [836, -458], [839, -426],
   ];
   const trail = ribbon(
     trailPts.map(([x, z]) => new THREE.Vector3(x, sampleTerrain(x, z) + 0.05, z)),
@@ -678,7 +681,6 @@ export function buildWorld(scene) {
 
   // ---- 桥（跨下切河道：桥面 y=1.2 高出水面 2.7m；梁 + 4 桥墩入水）----
   // ⚠️ 旧版栏杆沿 Z 摆放与过河方向垂直（等于横在路中间的栅栏），已纠正
-  const bridgeCenter = new THREE.Vector3(RIVER_X, 0, 60);
   const bridgeConcrete = createRoadMaterial('concrete', {color:0x8c887f,roughness:.9});
   const bridgeSteel = new THREE.MeshStandardMaterial({color:0x505b59,roughness:.64,metalness:.5});
   const supports = [], steelwork = [];
@@ -693,6 +695,13 @@ export function buildWorld(scene) {
       steelwork.push([x,1.82,z,.12,1.08,.14]);
     }
     steelwork.push([-900,1.59,z,80,.12,.14],[-900,2.18,z,80,.12,.16]);
+  }
+  // The southern crossing already has a road deck; give it visible support over the riverbed.
+  const southCrossing = country.samples.filter(({ pos }) => Math.abs(pos.x - RIVER_X) < 40 && pos.z < -650);
+  for (let i = 0; i < southCrossing.length; i += 3) {
+    const { pos } = southCrossing[i];
+    const bottom = groundSampler(pos.x, pos.z) - .3;
+    supports.push([pos.x, (bottom + pos.y) / 2, pos.z, 2.2, pos.y - bottom, 3.6]);
   }
   boxBatch(group,'bridge-concrete',bridgeConcrete,supports,true);
   boxBatch(group,'bridge-rails',bridgeSteel,steelwork,true);
@@ -736,6 +745,7 @@ export function buildWorld(scene) {
   // v2.33 建筑碰撞体：轴对齐脚印 {x, z, hw, hd}（楼块 rotation.y=0，玩家车圆-AABB 推出用）
   // ⚠️ 声明在块外：块内收集，buildWorld 末尾 return 导出
   const bldColliders = [];
+  const lakeClearance = (x, z, hw, hd) => !roadOverlapsBox(lakeRoad.samples, x, z, hw, hd, 1.5);
   // 巷道从街区正中穿过 → 楼房退到四象限（更小更密，城市感更强）
   // 公园街区：四象限草坪（矩形避开巷道与主街）+ 一个水池
   const PARK_BLOCKS = new Set(['1_2', '2_0']);
@@ -857,6 +867,7 @@ export function buildWorld(scene) {
             bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
             bz + qz * 28 + (Math.random() - 0.5) * 5
           );
+          if (!lakeClearance(dummy.position.x, dummy.position.z, w / 2, dpt / 2)) continue;
           dummy.scale.set(w, h, dpt);
           dummy.rotation.y = 0;
           dummy.updateMatrix();
@@ -905,6 +916,7 @@ export function buildWorld(scene) {
             bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
             bz + qz * 28 + (Math.random() - 0.5) * 5
           );
+          if (!lakeClearance(dummy.position.x, dummy.position.z, w / 2, dpt / 2)) continue;
           dummy.scale.set(w, h, dpt);
           dummy.updateMatrix();
           // v2.33 玻璃塔同样记录脚印碰撞体
@@ -956,7 +968,17 @@ export function buildWorld(scene) {
         const b=(alongZ?cuts[i].az:cuts[i].ax)-cuts[i].width/2-2;
         for (const side of [-1,1]) {
           const offset=(alongZ?street.ax:street.az)+side*(street.width/2+1.04);
-          walks.push(alongZ?[offset,.066,(a+b)/2,1.8,.11,b-a]:[(a+b)/2,.066,offset,b-a,.11,1.8]);
+          // Leave the diagonal lakeside junctions open without removing the whole walk.
+          for (let from = a; from < b;) {
+            let to = Math.min(b, from + 3);
+            const fits = (lo, hi) => alongZ
+              ? lakeClearance(offset, (lo + hi) / 2, .9, (hi - lo) / 2)
+              : lakeClearance((lo + hi) / 2, offset, (hi - lo) / 2, .9);
+            if (!fits(from, to)) { from = to; continue; }
+            while (to < b && fits(to, Math.min(b, to + 3))) to = Math.min(b, to + 3);
+            walks.push(alongZ ? [offset,.066,(from+to)/2,1.8,.11,to-from] : [(from+to)/2,.066,offset,to-from,.11,1.8]);
+            from = to;
+          }
         }
       }
     }
@@ -968,43 +990,44 @@ export function buildWorld(scene) {
     boxBatch(group,'city-crosswalks',createRoadMaterial('marking',{color:0xdfd8c8}),zebra);
   }
 
-  // ---- 红绿灯（城市主要路口，全城同步周期）----
+  // ---- 红绿灯（城市主要路口，按方向分相）----
   const lights = [];
   const poleMat = new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.6, metalness: 0.5 });
-  const lampMats = [];
-  for (const [lx, lz] of signalJunctions) {
-    const sx = lx + 7.5, sz = lz + 7.5;
-    const g2 = new THREE.Group();
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 6.5, 8), poleMat);
-    pole.position.set(sx, 3.25, sz);
-    g2.add(pole);
-    const box = new THREE.Mesh(new THREE.BoxGeometry(0.9, 2.2, 0.5), poleMat);
-    box.position.set(sx, 6.2, sz);
-    g2.add(box);
-    const lamps = [];
-    const cols = [0xff2222, 0xffcc22, 0x22ff44];
-    cols.forEach((c, i) => {
-      const m = new THREE.MeshStandardMaterial({
-        color: 0x111111, emissive: c, emissiveIntensity: 0.1, roughness: 0.4,
+  for (const [i, [lx, lz]] of signalJunctions.entries()) {
+    const heads = {};
+    for (const [axis, dx, dz] of [['x', 7.5, -7.5], ['z', 7.5, 7.5]]) {
+      const head = new THREE.Group();
+      head.position.set(lx + dx, 0, lz + dz);
+      head.rotation.y = axis === 'x' ? Math.PI / 2 : 0;
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 6.5, 8), poleMat);
+      pole.position.y = 3.25;
+      head.add(pole);
+      const box = new THREE.Mesh(new THREE.BoxGeometry(0.9, 2.2, 0.5), poleMat);
+      box.position.y = 6.2;
+      head.add(box);
+      heads[axis] = [0xff2222, 0xffcc22, 0x22ff44].map((c, k) => {
+        const material = new THREE.MeshStandardMaterial({ color: 0x111111, emissive: c, emissiveIntensity: 0.08 });
+        for (const sign of [-1, 1]) {
+          const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 8), material);
+          lamp.position.set(0, 7.05 - k * 0.85, sign * 0.29);
+          head.add(lamp);
+        }
+        return material;
       });
-      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 10), m);
-      lamp.position.set(sx, 7.05 - i * 0.85, sz - 0.29);
-      g2.add(lamp);
-      lamps.push(m);
-    });
-    group.add(g2);
-    lights.push({ pos: new THREE.Vector3(lx, 0, lz), lamps });
+      group.add(head);
+    }
+    lights.push({ pos: new THREE.Vector3(lx, 0, lz), heads, offset: i * 5 });
   }
-  let cycle = 0; // 全城同步：0-8s 绿 → 8-10s 黄 → 10-18s 红
-  const CY = 18;
-
+  let cycle = 0;
+  function signalAt(light, axis) {
+    const phase = (cycle + light.offset + (axis === 'z' ? 14 : 0)) % 28;
+    return phase < 10 ? 2 : phase < 12 ? 1 : 0;
+  }
   function update(dt) {
-    cycle = (cycle + dt) % CY;
-    const isGreen = cycle < 8, isYellow = cycle >= 8 && cycle < 10;
-    for (const L of lights) {
-      L.lamps[0].emissiveIntensity = (!isGreen && !isYellow) ? 2.2 : 0.08; // 红
-      L.lamps[1].emissiveIntensity = isYellow ? 2.2 : 0.08;                // 黄
-      L.lamps[2].emissiveIntensity = isGreen ? 2.2 : 0.08;                 // 绿
+    cycle = (cycle + dt) % 28;
+    for (const light of lights) for (const axis of ['x', 'z']) {
+      const state = signalAt(light, axis);
+      light.heads[axis].forEach((m, i) => { m.emissiveIntensity = i === state ? 2.2 : 0.08; });
     }
     // 水面动画（v2.24：water.js 统一推进波浪相位 + 法线贴图滚动）
     const t = performance.now() * 0.001;
@@ -1013,74 +1036,19 @@ export function buildWorld(scene) {
     const blink = Math.sin(t * 3) > 0 ? 2.2 : 0.15;
     for (const b of beaconBlinks) b.mesh.material.emissiveIntensity = blink;
   }
-  const isRed = () => !(cycle < 10);
 
   // ---- 查询 ----
   // 颠簸土路噪声：乡道 + 野径（确定性三频正弦，随位置变化不闪变）
   function bumpNoise(x, z) {
     return (Math.sin(x * 1.9) + Math.sin(z * 2.3) + Math.sin((x + z) * 1.3)) * 0.033;
   }
-  // v2.28: follow 铺路的路面精确高度 —— 最近样本段投影 → 段上侧向偏移 → 双路缘插值。
-  // 与 ribbon 路面同式（路缘 = 可视面侧点+lift，路面 = 两缘线性插值），凸形横断面也不浮不陷。
-  // 返回 { y: 路面高, d: 到路中线距离 }，70m 外返回 null
-  function mtnRoadY(samples, lift, x, z) {
-    let bi = -1, bd = Infinity;
-    for (let i = 0; i < samples.length; i++) {
-      const dx = samples[i].pos.x - x, dz = samples[i].pos.z - z;
-      const d = dx * dx + dz * dz;
-      if (d < bd) { bd = d; bi = i; }
-    }
-    if (bi < 0 || bd > 4900) return null;
-    const hw = samples[bi].w / 2;
-    let ry = null, rd = Infinity;
-    for (const off of [-1, 1]) {
-      const j = bi + off;
-      if (j < 0 || j >= samples.length) continue;
-      const a = samples[bi].pos, b = samples[j].pos;
-      const abx = b.x - a.x, abz = b.z - a.z;
-      const L2 = abx * abx + abz * abz;
-      if (L2 < 1e-6) continue;
-      const t = Math.max(0, Math.min(1, ((x - a.x) * abx + (z - a.z) * abz) / L2));
-      const px = a.x + abx * t, pz = a.z + abz * t;
-      const d = Math.hypot(x - px, z - pz);
-      if (d < rd) {
-        rd = d;
-        const s = samples[bi].side;
-        const gL = groundSampler(px + s.x * hw, pz + s.z * hw) + lift;
-        const gR = groundSampler(px - s.x * hw, pz - s.z * hw) + lift;
-        const o = Math.max(-hw, Math.min(hw, (x - px) * s.x + (z - pz) * s.z));
-        ry = gL * (o + hw) / (2 * hw) + gR * (hw - o) / (2 * hw);
-      }
-    }
-    return ry === null ? null : { y: ry, d: rd };
-  }
-  // 桥面高度：桥面沿 X 跨 x∈[-860,-940]（|dx|<40 全高 1.2，两端 30m 线性缓坡）
-  // v2.11：+ 山地地形高度场 + 土路颠簸（乡道/野径上车身真实起伏）
+  // Same triangles as the visible ribbon, including both river crossings and banked roads.
   function heightAt(pos) {
-    const x = pos.x, z = pos.z;
-    const dx = Math.abs(x - bridgeCenter.x);
-    if (Math.abs(z - bridgeCenter.z) < 6 && dx < 70) {
-      return 1.2 * Math.max(0, Math.min(1, (70 - dx) / 30));
-    }
-    // v2.28 物理基高 = 可视地面精确高度（山框内=山面网格，框外=5200 平面三角插值）
-    // —— 视觉与物理严格同源，坡地不再悬空/下陷
-    let h = groundSampler(x, z);
-    // 盘山路/山顶环岛路面高度（follow 铺路的实际路面：路缘 4.5m 内满高，6.5m 渐出到地面）
-    if (inMtnSq(x, z)) {
-      const g = groundSampler(x, z);
-      for (const [route, lift] of [[mountainRoad, 0.1], [summitRing, 0.2]]) {
-        const v = mtnRoadY(route.samples, lift, x, z);
-        if (!v || v.d >= 6.5) continue;
-        const k = Math.max(0, Math.min(1, (6.5 - v.d) / 2)); // 路缘外 2m 渐出
-        h = Math.max(h, g + (v.y - g) * k);
-      }
-    }
-    // 土路颠簸：乡道/野径上叠加路面起伏（车身真实颠簸）
-    if (distToRouteSamples(country.samples, x, z) <= 4.5
-      || distToRouteSamples(trail.samples, x, z) <= 2.8) {
-      h += bumpNoise(x, z);
-    }
-    return h;
+    const { x, z } = pos;
+    const ground = groundSampler(x, z);
+    const deck = roadIndex.deckAt(x, z);
+    const height = deck === null ? ground : Math.max(ground, deck);
+    return height + (deck !== null && surfaceAt(pos) === 'dirt' ? bumpNoise(x, z) : 0);
   }
   // 是否在城市路网 / 高速上（离路判定用）
   function distToCityRoads(x, z) {
@@ -1096,73 +1064,22 @@ export function buildWorld(scene) {
     return distToCityRoads(pos.x, pos.z) <= 7;
   }
 
-  // 到路面的距离（玩家离路判定用）
-  // ⚠️ 全采样（step=1）：旧版 i+=4 在长路上采样间隔 ~32m，玩家开在两点中间
-  //    会被误判越野（阈值 5.5/11 挡不住 16m 的采样间隙）。每帧千次距离计算可忽略
-  function distToRouteSamples(samples, x, z, step = 1) {
-    let best = Infinity;
-    for (let i = 0; i < samples.length; i += step) {
-      const p = samples[i].pos;
-      const d = Math.hypot(x - p.x, z - p.z);
-      if (d < best) best = d;
-    }
-    return best;
+  const roads = Object.entries({ highway, eastConn: eastConnRoad, southConn: southConnRoad,
+    lakeRoad, roundabout, national, mountainRoad, summitRing, trail, westLake: westLakeRoad,
+    swLink: swLinkRoad, country }).map(([id, route]) => ({ ...route, id,
+      kind: id === 'trail' || id === 'country' ? 'dirt' : 'pave' }));
+  for (const [i, st] of cityStreets.entries()) {
+    roads.push({ id: `city${i}`, kind: 'pave', samples: [
+      { pos: { x: st.ax, y: 0.02, z: st.az }, w: st.width },
+      { pos: { x: st.bx, y: 0.02, z: st.bz }, w: st.width },
+    ] });
   }
-  function onHighway(x, z) {
-    // Use the same straight segments as the rendered ribbon. Point distance
-    // incorrectly leaves gaps along the outer lane between samples.
-    const hs = highway.samples;
-    for (let i = 1; i < hs.length; i++) {
-      const a = hs[i - 1].pos, b = hs[i].pos;
-      if (Math.abs(x - a.x) > 20 || Math.abs(z - a.z) > 20) continue;
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / (dx * dx + dz * dz)));
-      if ((x - a.x - dx * t) ** 2 + (z - a.z - dz * t) ** 2 <= 121) return true;
-    }
-    return false;
+  const roadIndex = buildRoadIndex(roads);
+  function surfaceAt({ x, z }) {
+    return northInterchange.contains(x, z) ? 'pave' : roadIndex.surfaceAt(x, z);
   }
-  function onAnyRoad(pos, skipHighway = false) {
-    const x = pos.x, z = pos.z;
-    return (!skipHighway && (northInterchange.contains(x, z) || onHighway(x, z))) || isOnCityRoad(pos)
-      || distToRouteSamples(country.samples, x, z) <= 5.5
-      || distToRouteSamples(eastConnRoad.samples, x, z) <= 8.5
-      || distToRouteSamples(southConnRoad.samples, x, z) <= 8.5
-      || distToRouteSamples(lakeRoad.samples, x, z) <= 5.5
-      || distToRouteSamples(roundabout.samples, x, z) <= 5.5
-      || distToRouteSamples(national.samples, x, z) <= 7.5
-      || distToRouteSamples(mountainRoad.samples, x, z) <= 5.5
-      || distToRouteSamples(summitRing.samples, x, z) <= 5.5
-      || distToRouteSamples(trail.samples, x, z) <= 3 // 野径单车道：路缘外就是野地
-      || distToRouteSamples(westLakeRoad.samples, x, z) <= 6
-      || distToRouteSamples(swLinkRoad.samples, x, z) <= 6.5;
-  }
-  // 路面材质查询（v2.20，越野分级用）：'dirt'=土路（乡道+野径颠簸路）/ 'pave'=铺装
-  // 野地（草地）由调用方以 null 表示——isOffroad 先判"路外"再查材质
-  function surfaceAt(pos) {
-    const x = pos.x, z = pos.z;
-    if (northInterchange.contains(x, z) || onHighway(x, z)) return 'pave';
-    if (distToRouteSamples(country.samples, x, z) <= 5.5
-      || distToRouteSamples(trail.samples, x, z) <= 3) return 'dirt';
-    return onAnyRoad(pos, true) ? 'pave' : null;
-  }
-  function distToRoads(x, z) {
-    // 供植被/建筑生成避让：全部铺装+土路（城市街道也包含）
-    let d = distToCityRoads(x, z);
-    d = Math.min(d, distToRouteSamples(highway.samples, x, z));
-    d = Math.min(d, distToRouteSamples(country.samples, x, z));
-    d = Math.min(d, distToRouteSamples(eastConnRoad.samples, x, z));
-    d = Math.min(d, distToRouteSamples(southConnRoad.samples, x, z));
-    d = Math.min(d, distToRouteSamples(lakeRoad.samples, x, z));
-    d = Math.min(d, distToRouteSamples(roundabout.samples, x, z));
-    d = Math.min(d, distToRouteSamples(national.samples, x, z));
-    d = Math.min(d, distToRouteSamples(mountainRoad.samples, x, z));
-    d = Math.min(d, distToRouteSamples(summitRing.samples, x, z));
-    d = Math.min(d, distToRouteSamples(trail.samples, x, z));
-    d = Math.min(d, distToRouteSamples(westLakeRoad.samples, x, z));
-    d = Math.min(d, northInterchange.distance(x, z));
-    d = Math.min(d, distToRouteSamples(swLinkRoad.samples, x, z));
-    return d;
-  }
+  const onAnyRoad = (pos) => surfaceAt(pos) !== null;
+  const distToRoads = (x, z) => Math.min(roadIndex.distance(x, z), northInterchange.distance(x, z));
 
   // ---- 冲刺/越野赛路线（v2.32）----
   // routeFromPoints：任意点列 → 轻量路线对象（curve+samples+length，无路面网格）；
@@ -1170,7 +1087,7 @@ export function buildWorld(scene) {
   const routeFromPoints = (pts, width, id) => {
     const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.35);
     const length = curve.getLength();
-    const n = Math.max(8, Math.round(length / 8));
+    const n = Math.max(8, Math.round(length / 4));
     const samples = [];
     for (let k = 0; k <= n; k++) {
       const t = k / n;
@@ -1188,14 +1105,25 @@ export function buildWorld(scene) {
     for (let k = i0; k <= i1; k++) pts.push(s[k].pos.clone());
     return routeFromPoints(pts, s[i0].w, id);
   };
+  // The canyon race actually crosses the river: continue onto the country bridge.
+  const approachBridge = [...national.samples.slice(9).map(s => s.pos.clone())];
+  const join = approachBridge.at(-1);
+  let countryStart = 0;
+  for (let i = 1; i < country.samples.length / 4; i++) {
+    if (country.samples[i].pos.distanceToSquared(join) < country.samples[countryStart].pos.distanceToSquared(join)) countryStart = i;
+  }
+  for (const { pos } of country.samples.slice(countryStart + 1)) {
+    approachBridge.push(pos.clone());
+    if (pos.x < -1000) break;
+  }
   const sprintRoutes = {
-    highway: sliceRoute(highway, 0.03, 0.42, 'sprint_highway'),   // 高速直通段
-    canyon: sliceRoute(national, 0.0, 1.0, 'sprint_canyon'),      // 国道全段（跨河桥）
-    lakeside: sliceRoute(lakeRoad, 0.0, 1.0, 'sprint_lakeside'),  // 湖滨路全段
+    highway: sliceRoute(highway, 0.03, 0.42, 'sprint_highway'),
+    canyon: routeFromPoints(approachBridge, 8, 'sprint_canyon'),
+    lakeside: sliceRoute(westLakeRoad, 0.045, 0.985, 'sprint_lakeside'),
   };
-  // 越野赛·湖东狂飙：沿野径取 12 点横向 ±30m 扰动进草地（点高按地形，避水回撤到野径）
+  // 越野赛·湖东狂飙：沿野径外缘绕湖，控制点避水。
   {
-    const offs = [0, 16, 28, 20, -8, -24, -16, 4, 18, 26, 16, 0];
+    const offs = [0, -10, -18, -12, -8, -16, -14, -5, -14, -18, -10, 0];
     const N = 12;
     const pts = [];
     for (let k = 0; k < N; k++) {
@@ -1206,7 +1134,7 @@ export function buildWorld(scene) {
       p.y = Math.max(0.05, h + 0.22);
       pts.push(p);
     }
-    sprintRoutes.offroad = routeFromPoints(pts, 7, 'offroad_stampede');
+    sprintRoutes.offroad = routeFromPoints(pts, 14, 'offroad_stampede');
   }
 
   const lines = (...routes) => routes.map(route => route.samples.map(({ pos }) => [pos.x, pos.z]));
@@ -1217,7 +1145,8 @@ export function buildWorld(scene) {
     local: [...cityStreets.map(s => [[s.ax, s.az], [s.bx, s.bz]]),
       ...lines(lakeRoad, westLakeRoad, roundabout, mountainRoad, summitRing)],
     dirt: lines(country, trail),
-    bridge: lines(country).map(line => line.filter(([x, z]) => Math.abs(x - RIVER.x) <= 40 && Math.abs(z - 61) < 10)),
+    bridge: [lines(country)[0].filter(([x, z]) => Math.abs(x - RIVER.x) <= 40 && Math.abs(z - 61) < 10),
+      southCrossing.map(({ pos }) => [pos.x, pos.z])],
   };
   const guide = worldGuide({ MT, northInterchange, national, country, lakeRoad, westLakeRoad, mountainRoad });
   addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 &&
@@ -1238,9 +1167,9 @@ export function buildWorld(scene) {
     lakeRoad, roundabout, national, mountainRoad, summitRing, trail,
     sprintRoutes, bldColliders,
     terrainH, sampleTerrain, groundSampler, MT,
-    lights, update, isRed,
+    lights, update, signalAt,
     heightAt, isOnCityRoad, distToCityRoads,
     onAnyRoad, surfaceAt, distToRoads,
-    mapRoads, guide,
+    roads, mapRoads, guide,
   };
 }

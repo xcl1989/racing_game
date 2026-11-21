@@ -5,7 +5,10 @@ import { MapView } from './map-view.js';
 import { buildNavGraph, findRoute, NavGuide } from './nav.js';
 import { eventReward, markRaceResult, ODO_STEP, ODO_MIN_SPEED, ODO_FRAME_CAP } from './economy.js'; // v2.32 积分经济
 
-const LAPS_RACE = 3;
+import { RACE_PROGRAM, gateAt, crossingFraction, sectorProjection, paceProfile } from './race-rules.js';
+import { trafficTargets } from './traffic.js';
+
+const RECORD_VERSION = new Set(['race', 'time', 'drag', 'sprint_highway', 'sprint_canyon', 'sprint_lakeside', 'offroad_stampede']);
 const $ = (id) => document.getElementById(id);
 const fmtTime = (s) => {
   const m = Math.floor(s / 60), sec = s % 60;
@@ -17,14 +20,13 @@ export class Game {
     this.track = track; this.player = player; this.ais = ais;
     this.dust = dust; this.skids = skids; this.smoke = smoke; this.audio = audio;
     this.world = world; this.traffic = traffic;
+    this.moveFrom = new THREE.Vector3();
+    this.moveTo = new THREE.Vector3();
     this.lastRoadPos = track.startPos.clone(); // 落水拖回的兜底点（起点格）
-    // 漫游时世界路网（高速/乡道/城市街道）不算越野
-    this.track.worldOnRoad = (pos) => this.world.onAnyRoad(pos);
     this.mode = 'free';
     this.state = 'menu';           // menu | countdown | running | paused | finished
-    this.lap = 1; this.nextGate = 1;
+    this.lap = 1; this.nextGate = 0;
     this.elapsed = 0; this.countdown = 0;
-    this.lastT = 0;
     this.crashShake = 0; // 碰撞震屏强度（随时间衰减）
     this.dismissedFor = null; // 「稍后再说」忽略的活动（驶出范围后重置）
 
@@ -42,7 +44,7 @@ export class Game {
     this._sessionStart = Date.now();
     this._autosaveT = 0;         // 自由漫游 60s 定时存档
     this._savedPos = null;       // 比赛中不覆盖存档位置（读档点兜底）
-    this.sprint = null;          // {def, R, cursor, playerTotal, nextCp, cps, gates}
+    this.sprint = null;
 
     this.mmZooms = [
       { label: '自动', range: 245, auto: true },
@@ -75,7 +77,7 @@ export class Game {
     const S = this.track.strip;
     this.events = [
       {
-        mode: 'race', name: '🏁 公路环道赛', desc: '3 圈 · 对抗 3 名 AI',
+        mode: 'race', name: '🏁 公路环道赛', desc: `${RACE_PROGRAM.race.laps} 圈 · 对抗 ${this.ais.length} 名 AI`,
         color: 0xffaa22, radius: 14, pos: mkPos(0.008, OFF),
       },
       {
@@ -87,7 +89,7 @@ export class Game {
         color: 0x22dd88, radius: 14, pos: mkPos(0.75, OFF),
       },
       {
-        mode: 'drag', name: '🚀 直线加速赛', desc: '760m 直线冲刺 · 计时 + 尾速',
+        mode: 'drag', name: '🚀 直线加速赛', desc: `${S.finish} m 计时区 · 按冲线速度结算`,
         color: 0xff4455, radius: 16, pos: new THREE.Vector3(S.ax + 12, 0, S.az + 20),
       },
     ];
@@ -99,9 +101,9 @@ export class Game {
       { key: 'sprint_highway', mode: 'sprint', route: SR.highway, name: '🏁 高速冲刺',
         desc: '高速直通段 · 3 名 AI · 首胜 +30💎', color: 0xff77cc },
       { key: 'sprint_canyon', mode: 'sprint', route: SR.canyon, name: '🏁 峡谷冲刺',
-        desc: '国道 · 跨河大桥 · 3 名 AI · 首胜 +45💎', color: 0xff77cc },
-      { key: 'sprint_lakeside', mode: 'sprint', route: SR.lakeside, name: '🏁 海滨冲刺',
-        desc: '湖滨公路 · 3 名 AI · 首胜 +40💎', color: 0xff77cc },
+        desc: '国道 · 西河桥 · 3 名 AI · 首胜 +45💎', color: 0xff77cc },
+      { key: 'sprint_lakeside', mode: 'sprint', route: SR.lakeside, name: '🏁 镜湖冲刺',
+        desc: '镜湖西岸 · 3 名 AI · 首胜 +40💎', color: 0xff77cc },
       { key: 'offroad_stampede', mode: 'offroad', route: SR.offroad, name: '🌲 越野 · 湖东狂飙',
         desc: '野地检查点拉力 · 推荐越野车 · 首胜 +60💎', color: 0x88ff44 },
     ];
@@ -117,7 +119,8 @@ export class Game {
       }
       d.pos = pos || s0.pos.clone().addScaledVector(s0.side, 12).setY(0);
       d.radius = 16;
-      d.desc = `${(R.length / 1000).toFixed(1)} km · ${d.desc}`;
+      const cfg = RACE_PROGRAM[d.key];
+      d.desc = `${(R.length * cfg.finish / 1000).toFixed(2)} km · ${cfg.gates - 1} 门 + 终点 · ${d.desc}`;
       this.events.push(d);
     }
     this.sprintDefs = sprintDefs;
@@ -129,11 +132,12 @@ export class Game {
       blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
     });
     for (const ev of this.events) {
+      ev.pos.y = this.heightAt(ev.pos);
       const beam = new THREE.Mesh(
         new THREE.CylinderGeometry(0.5, 0.95, 11, 12, 1, true),
         beamMatOf(ev.color)
       );
-      const y = this.world.groundSampler(ev.pos.x, ev.pos.z);
+      const y = ev.pos.y;
       beam.position.copy(ev.pos).setY(y + 5.5);
       this.eventGroup.add(beam);
       const ring = new THREE.Mesh(
@@ -173,35 +177,36 @@ export class Game {
     this.promptEvent = null;
 
     // ---- v2.32 赛事检查点门组（每条路线独立 Group，仅该赛事进行中可见）----
-    // 门=~350m 一座：两根发光柱 + 顶横梁；终点门加旗门横幅色带
+    // 门的位置和有效宽度同时用于渲染和计时。
     this.sprintGateGroups = {};
+    this.circuitPace = paceProfile(this.track, 6.1);
     const gateMat = (c) => new THREE.MeshStandardMaterial({
       color: c, emissive: c, emissiveIntensity: 1.8, metalness: 0.3, roughness: 0.4,
     });
     for (const d of this.sprintDefs) {
       const g = new THREE.Group();
       const R = d.route;
-      const nGates = Math.max(3, Math.round(R.length / 350)); // 含终点门
-      d.gateDists = []; // 各门的曲线里程（进度判定用）
+      const { gates: nGates, grip, finish } = RACE_PROGRAM[d.key];
+      d.gates = [];
+      d.limit = paceProfile(R, grip);
       for (let k = 1; k <= nGates; k++) {
         const isFinish = k === nGates;
-        // 常规检查点均布至 92% 处；终点旗门压到末端 99.3%（冲线判定=全门通过）
-        const t = isFinish ? 0.993 : (k / nGates) * 0.92;
-        const p = R.curve.getPointAt(t);
-        const tan = R.curve.getTangentAt(t).setY(0).normalize();
+        const t = finish * k / nGates;
+        const gate = gateAt(R, t, R.width / 2 + 1.35);
+        const { pos: p, tan, halfWidth: half } = gate;
+        d.gates.push(gate);
         const side = new THREE.Vector3(tan.z, 0, -tan.x);
-        const half = R.width / 2 + 1.6;
-        d.gateDists.push(t * R.length);
         for (const sgn of [-1, 1]) {
           const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 5, 8), gateMat(d.color));
-          pole.position.copy(p).addScaledVector(side, sgn * half).setY(2.5);
+          pole.position.copy(p).addScaledVector(side, sgn * half);
+          pole.position.y = this.world.heightAt(pole.position) + 2.5;
           g.add(pole);
         }
         const beam = new THREE.Mesh(
           new THREE.BoxGeometry(half * 2 + 0.6, 0.28, 0.28),
           gateMat(isFinish ? 0xffdd44 : d.color)
         );
-        beam.position.copy(p).setY(5.1);
+        beam.position.copy(p).setY(p.y + 5.1);
         beam.rotation.y = Math.atan2(tan.x, tan.z) + Math.PI / 2;
         g.add(beam);
         if (isFinish) { // 终点旗门横幅
@@ -209,7 +214,7 @@ export class Game {
             new THREE.BoxGeometry(half * 2, 1.1, 0.06),
             new THREE.MeshBasicMaterial({ color: 0x111418, transparent: true, opacity: 0.85 })
           );
-          banner.position.copy(p).setY(4.4);
+          banner.position.copy(p).setY(p.y + 4.4);
           banner.rotation.y = beam.rotation.y;
           g.add(banner);
         }
@@ -244,76 +249,68 @@ export class Game {
     this.track.gatesGroup.parent.add(this.ringGroup); // 挂到 scene
   }
 
+  heightAt(pos) {
+    const height = this.world.heightAt(pos);
+    return this.track.onStrip(pos.x, pos.z) ? Math.max(0.02, height) : height;
+  }
+
   drawMinimap() { this.mapView.drawMini(this); }
 
   // ---- 模式启动 ----
   startMode(mode, ev = null) {
     this.mode = mode;
     this.sprint = null;
-    // 自由漫游免倒计时直接开跑；其余模式 3.2s 倒计时
+    const def = mode === 'sprint' || mode === 'offroad'
+      ? this.sprintDefs.find(d => d.mode === mode && d.key === ev?.key) ?? this.sprintDefs.find(d => d.mode === mode)
+      : null;
+    this._activeKey = def?.key ?? mode;
+    this.program = RACE_PROGRAM[this._activeKey];
     this.state = mode === 'free' ? 'running' : 'countdown';
-    this.countdown = 3.2;
+    this.countdown = this.program?.countdown ?? 0;
+    this._lastCnt = null;
+    this._stateBeforePause = null;
     this.elapsed = 0;
     this.lap = 1;
-    this.nextGate = 1;
+    this.nextGate = 0;
     this.collected = 0;
-    this.lastT = 0;
     this.topSpeed = 0;
+    this.rank = 0;
+    this.raceProgress = 0;
+    this.raceCursor = 0;
+    this.onRaceLine = true;
+    this.waterT = 0;
+    this._wasInWater = false;
     this.audio.init();
+    this.setPromptEvent(null);
 
-    // 🚀 直线加速赛：起跑到终点线沿直线赛道，不占环道发车格
+    const S = this.track.strip;
     if (mode === 'drag') {
-      const S = this.track.strip;
-      const startYaw = Math.atan2(S.bx - S.ax, S.bz - S.az);
-      const side = new THREE.Vector3((S.bz - S.az), 0, -(S.bx - S.ax)).normalize();
-      const p0 = new THREE.Vector3(S.ax, 0, S.az)
-        .addScaledVector(side, -3.5)
-        .add(new THREE.Vector3(0, 0, 14));
-      this.player.reset(p0, startYaw);
-      this.dragEnd = new THREE.Vector3(S.bx, 0, S.bz);
-      this.eventGroup.visible = false;
-    } else if (mode === 'sprint' || mode === 'offroad') {
-      // ---- v2.32 冲刺/越野赛：单向路线点对点，检查点门按序通过 ----
-      const def = ev && ev.route ? ev
-        : this.sprintDefs.find((d) => d.mode === mode) || this.sprintDefs[0];
-      const R = def.route;
-      const tan0 = R.curve.getTangentAt(0).setY(0).normalize();
-      const side0 = new THREE.Vector3(tan0.z, 0, -tan0.x);
-      const lanes = mode === 'offroad' ? [-3.5, -1.2, 1.2, 3.5] : [-4, -1.4, 1.4, 4];
-      this.player.reset(R.startPos.clone().addScaledVector(side0, lanes[3]), Math.atan2(tan0.x, tan0.z));
-      // 进度游标 + 检查点里程表（按序通过，进度单调推进防倒车刷门）
-      this.sprint = {
-        def, R, cursor: 0, playerTotal: 0, nextCp: 0,
-        cps: def.gateDists, aiFinished: [null, null, null],
-      };
-      this.ais.forEach((ai, i) => ai.resetSprint(R, lanes[i]));
-      this._activeKey = def.key;
-      this.eventGroup.visible = false;
-    } else {
-      // ★ 发车格：P1 最前，前后错列 8m + 左右交错 ±3m；AI 占 P1-P3，玩家 P4
-      const gridSlot = (k) => {
-        const d = 6 + k * 8;                                 // 距起点线的前向距离
-        const t = Math.min(0.09, d / this.track.length);     // 保持在前第一个检查点之内
-        const p = this.track.curve.getPointAt(t);
-        const tan = this.track.curve.getTangentAt(t).setY(0).normalize();
-        const side = new THREE.Vector3(tan.z, 0, -tan.x);
-        const pos = p.clone().addScaledVector(side, k % 2 === 0 ? 3 : -3);
-        const yaw = Math.atan2(tan.x, tan.z);
-        return { pos, yaw, d, t };
-      };
-
-      // 竞速赛玩家 P4 追赶；计时赛单人占 P1 头排；自由漫游从起点出发
-      const pSlot = gridSlot(mode === 'race' ? 3 : 0);
-      this.player.reset(pSlot.pos, pSlot.yaw);
-      this.player.trackT = pSlot.t;
-      this.lastT = pSlot.t;
-      this.ais.forEach((ai, i) => {
-        ai.reset(this.track);
-        const s = gridSlot(i);
-        ai.total = s.d;
-        ai.place(this.track);
+      const dx = (S.bx - S.ax) / S.length, dz = (S.bz - S.az) / S.length;
+      const tan = new THREE.Vector3(dx, 0, dz);
+      this.player.reset(new THREE.Vector3(S.ax, 0, S.az), Math.atan2(dx, dz));
+      this.dragGate = { pos: this.player.pos.clone().addScaledVector(tan, S.finish), tan, halfWidth: S.width / 2 };
+    } else if (def || mode === 'race' || mode === 'time') {
+      const R = def?.route ?? this.track;
+      const grid = (slot) => ({ distance: 3 + 7 * Math.floor(slot / 2), lane: (slot % 2 ? 1 : -1) * Math.min(2.8, (R.width ?? 14) * 0.27) });
+      const spot = grid(mode === 'time' ? 2 : 1);
+      const t = spot.distance / R.length;
+      const tan = R.curve.getTangentAt(t).setY(0).normalize();
+      const pos = R.curve.getPointAt(t).addScaledVector(new THREE.Vector3(tan.z, 0, -tan.x), spot.lane);
+      this.player.reset(pos, Math.atan2(tan.x, tan.z));
+      this.raceProgress = spot.distance;
+      if (def) this.sprint = { def, R, playerTotal: spot.distance, nextCp: 0, cps: def.gates };
+      if (mode !== 'time') this.ais.forEach((ai, i) => {
+        const start = grid(i < 2 ? i + 2 : 0);
+        ai.resetRace(R, start.distance, start.lane, {
+          speed: this.program.pace?.[i] ?? [33, 37, 41][i],
+          accel: [7.2, 8.1, 9][i], reaction: [0.64, 0.38, 0.22][i],
+          limit: def?.limit ?? this.circuitPace,
+        });
       });
+    } else {
+      this.player.reset(this.track.startPos, this.track.startYaw);
     }
+    this.lastRoadPos.copy(this.player.pos);
 
     const raceLike = mode === 'race' || mode === 'time';
     const sprintLike = mode === 'sprint' || mode === 'offroad';
@@ -330,17 +327,20 @@ export class Game {
     this.ais.forEach((a) => { a.group.visible = showAI; });
     // 自由漫游：AI 车随机相位分散到环道各处巡航（不再停在起步格"陪着"玩家）
     if (mode === 'free') {
-      this.ais.forEach((ai) => {
+      this.ais.forEach((ai, i) => {
         ai.group.visible = true;
+        ai.lane = [-3.5, 2, 3.8][i];
+        ai.route = this.track;
+        ai.finishTime = null;
         ai.total = Math.random() * this.track.length;
         ai.speed = 0;
         ai.reaction = 0.2 + Math.random() * 0.5;
-        ai.place(this.track);
+        ai.placeOn(this.track);
       });
     }
     // NPC 车流只在漫游/收集时出现（比赛让路，直线赛道空旷）
     this.traffic.forEach((t) => { t.group.visible = mode === 'free' || mode === 'collect'; });
-    for (const r of this.rings) r.userData.done = false;
+    for (const r of this.rings) { r.userData.done = false; r.visible = true; }
 
     $('menu').style.display = 'none';
     $('result').style.display = 'none';
@@ -353,25 +353,24 @@ export class Game {
     $('collect-label').textContent = infoBox === 'cp' ? '检查点'
       : (infoBox === 'drag' ? '剩余' : '能量环');
     $('collect-box').style.display = infoBox ? 'block' : 'none';
-    $('collect-val').textContent = infoBox === 'drag' ? '760 m'
+    $('collect-val').textContent = infoBox === 'drag' ? `${S.finish} m`
       : (infoBox === 'cp' ? `0 / ${this.sprint.cps.length}` : '0 / 14');
     $('lap-box').style.display = raceLike ? 'block' : 'none';
     $('rank-box').style.display = mode === 'race' || sprintLike ? 'block' : 'none';
     // v2.32：sprint 分支文案延迟取值（对象字面量会急切求值，free 模式下 sprint 为 null）
     const defName = this.sprint ? this.sprint.def.name.replace(/^🏁 |^🌲 /, '') : '';
     const modeName = {
-      race: '🏁 竞速赛 3圈', time: '⏱ 计时赛 1圈', collect: '💠 收集挑战',
+      race: `🏁 竞速赛 ${RACE_PROGRAM.race.laps}圈`, time: `⏱ 计时赛 ${RACE_PROGRAM.time.laps}圈`, collect: '💠 收集挑战',
       drag: '🚀 直线加速赛', free: '🌊 自由漫游',
       sprint: `🏁 冲刺赛 · ${defName}`,
       offroad: `🌲 越野赛 · ${defName}`,
     };
     $('mode-val').textContent = modeName[mode];
-    // 赛事纪录键：环道四模式用 mode 名，冲刺/越野用事件 key（同模式多路线）
-    this._activeKey = this._activeKey || mode;
-    if (!sprintLike) this._activeKey = mode;
     const best = this.getBest(this._activeKey);
     $('best-line').style.display = best ? 'block' : 'none';
-    if (best) $('best-val').textContent = fmtTime(parseFloat(best));
+    if (best) $('best-val').textContent = fmtTime(best);
+    $('lap-val').textContent = `1 / ${this.program?.laps ?? 1}`;
+    $('rank-val').textContent = `${this.ais.length + 1} / ${this.ais.length + 1}`;
     if (mode === 'free') {
       this.toast('开到地图上的彩色光柱即可报名比赛', 3500);
     } else {
@@ -396,6 +395,8 @@ export class Game {
     $('hud').style.display = 'none';
     $('controls').style.display = 'none';
     this.track.gatesGroup.visible = false;
+    for (const g of Object.values(this.sprintGateGroups)) g.visible = false;
+    this.eventGroup.visible = false;
     if (this.track.railGroup) this.track.railGroup.visible = false;
     this.traffic.forEach((t) => { t.group.visible = false; });
     this.ringGroup.visible = false;
@@ -517,7 +518,7 @@ export class Game {
     }
     this.nav = { name, dest: new THREE.Vector3(pos.x, pos.y || 0, pos.z), pts: full, cum, cursor: 0, rerouteT: 0, fallback, hops };
     if (fallback) this.navGuide.clear();
-    else this.navGuide.setRoute(full);
+    else this.navGuide.setRoute(full.slice(1, -1), new THREE.Vector3(pos.x, this.heightAt(pos), pos.z));
   }
 
   clearNav() {
@@ -607,7 +608,7 @@ export class Game {
   }
 
   // 玩家 × AI：双圆检测，最深穿透对响应。
-  // 玩家：法向反弹（相对速度弹性 0.35）+ 位置分离 + 横摆扰动；AI：total/speed 惩罚（其位置由路线派生）
+  // 玩家：法向反弹（相对速度弹性 0.35）+ 位置分离 + 横摆扰动；AI 只减速，不修改已完成的进度
   carVsCar(player, ai, withSound) {
     const pc = Game.carCircles(player.pos, player.yaw);
     const ac = Game.carCircles(ai.pos, ai.yaw);
@@ -624,23 +625,22 @@ export class Game {
     }
     if (!deepest) return;
     const { pen, nx, nz, cx, cz } = deepest;
-    // 分离：玩家位置推开全部穿透量（AI 位置是派生的，推不动，用 total 惩罚表达）
+    // 分离：玩家位置推开全部穿透量（AI 的位置由路线派生）
     player.pos.x += nx * pen;
     player.pos.z += nz * pen;
     // 法向弹性反弹（e=0.35）：按速度矢量在碰撞法线上的投影算——
     // 正撞掉速多、侧面擦蹭几乎不掉速（vN/v 比例即对齐度）
     const vy = player.travelYaw ?? player.yaw;
     const fX = Math.sin(vy), fZ = Math.cos(vy);
-    const vn = player.speed * (fX * nx + fZ * nz); // >0 = 撞向对方，<0 = 倒车撞
+    const vn = player.speed * (fX * nx + fZ * nz); // 玩家沿外法线的速度分量
     const vnAbs = Math.abs(vn);
-    if (vnAbs > 0.5 && Math.abs(player.speed) > 1) {
+    const aiNormal = ai.speed * (Math.sin(ai.yaw) * nx + Math.cos(ai.yaw) * nz);
+    if (vn - aiNormal < -0.5 && vnAbs > 0.5 && Math.abs(player.speed) > 1) {
       const ratio = Math.min(1, vnAbs / Math.abs(player.speed)); // 撞击对齐度
       player.speed *= Math.sqrt(Math.max(0.08, 1 - 0.88 * ratio * ratio)); // e=0.35 反弹
       // 横摆扰动：撞击点在车身的横向力臂决定车头被带偏的方向
       const lat = (cx - player.pos.x) * Math.cos(player.yaw) - (cz - player.pos.z) * Math.sin(player.yaw);
       player.driftYaw += Math.sign(lat || 1) * Math.min(0.3, ratio * 0.35);
-      // AI 惩罚：被撞退 + 掉速（其位置由路线派生）
-      ai.total = Math.max(ai.total - pen * 1.2, 0);
       if (ai.speed != null) ai.speed *= 0.72;
       if (withSound) {
         const impact = Math.min(1, vnAbs / 22);
@@ -652,21 +652,8 @@ export class Game {
     }
   }
 
-  // AI × AI：只交换 total/speed 惩罚（位置派生，无音效）
-  aiVsAi(a, b) {
-    const dx = a.pos.x - b.pos.x, dz = a.pos.z - b.pos.z;
-    const d = Math.hypot(dx, dz);
-    if (d < 3.2 && d > 0.01) {
-      const overlap = (3.2 - d) * 0.5;
-      const lead = a.total > b.total ? a : b;   // 后车撞前车：后车减速
-      const rear = a.total > b.total ? b : a;
-      rear.total = Math.max(rear.total - overlap, 0);
-      rear.speed = Math.min(rear.speed, lead.speed * 0.9);
-    }
-  }
-
   // 玩家 × 建筑群：双圆 × AABB，推出 + 法向反弹 + 音效/震屏
-  carVsBuildings(dt) {
+  carVsBuildings() {
     const cols = this.world.bldColliders;
     if (!cols || !cols.length) return;
     const p = this.player;
@@ -714,11 +701,13 @@ export class Game {
   // ---- v2.32 存档 / 积分 / 车库 ----
   // 纪录读写：有槽位走槽位表，否则回退全局 rg_best_*（测试直开模式兼容）
   getBest(key) {
+    if (RECORD_VERSION.has(key)) key += '_p11';
     if (this.bests) return this.bests[key] || null;
     const v = parseFloat(localStorage.getItem(`rg_best_${key}`) || '');
     return v > 0 ? v : null;
   }
   setBest(key, t) {
+    if (RECORD_VERSION.has(key)) key += '_p11';
     if (this.bests) {
       if (!this.bests[key] || t < this.bests[key]) { this.bests[key] = t; return true; }
       return false;
@@ -768,27 +757,17 @@ export class Game {
     const p = this.returnPos || this.track.startPos;
     const yaw = this.player.yaw;
     this.startMode('free');
-    this.player.reset(p.clone().setY(0), yaw);
-  }
-
-  // ---- 检查点穿越判定（处理环形回绕）----
-  crossed(prev, cur, g) {
-    return prev <= cur ? (g > prev && g <= cur) : (g > prev || g <= cur);
+    this.player.reset(p.clone().setY(this.heightAt(p)), yaw);
+    this.lastRoadPos.copy(this.player.pos);
   }
 
   finish() {
     this.state = 'finished';
     this.audio.setSpeed(0, false);
     let title = '🏁 完成！', line = '';
-    const sprintLike = this.mode === 'sprint' || this.mode === 'offroad';
+    const sprintLike = !!this.sprint;
     const key = this._activeKey;
-    // 名次：环道按里程；冲刺/越野按冲线时间（完赛早于我方者排前面）
-    let rank = 0;
-    if (this.mode === 'race') {
-      rank = 1 + this.ais.filter((a) => a.total > this.player.total).length;
-    } else if (sprintLike) {
-      rank = 1 + this.ais.filter((a) => a.finishTime != null && a.finishTime <= this.elapsed).length;
-    }
+    const rank = this.rank;
     if (this.mode === 'race' || sprintLike) {
       title = rank === 1 ? '🏆 冠军！' : `第 ${rank} 名`;
       line = `用时 ${fmtTime(this.elapsed)}`;
@@ -816,6 +795,8 @@ export class Game {
       }
       this.save(); // 比赛结算 = 存档触发点 1
     }
+    $('time-val').textContent = fmtTime(this.elapsed);
+    if (this.mode === 'drag') $('collect-val').textContent = '0 m';
     $('res-title').textContent = title;
     $('res-line').textContent = line;
     $('result').style.display = 'flex';
@@ -848,8 +829,14 @@ export class Game {
     this.elapsed += dt;
 
     // 玩家物理（含桥面高度平滑过渡）
-    const groundY = this.world ? this.world.heightAt(this.player.pos) : 0;
+    const checkRace = this.mode === 'race' || this.mode === 'time' || this.mode === 'drag' || !!this.sprint;
+    const previous = checkRace ? this.moveFrom.copy(this.player.pos) : null;
+    const prevSpeed = this.player.speed;
+    let recovered = false;
+    const groundY = this.heightAt(this.player.pos);
     const res = this.player.update(dt, input, this.track, groundY);
+    const driven = checkRace ? this.moveTo.copy(this.player.pos) : null;
+    const driveSpeed = this.player.speed;
 
     // 落水处理（v2.12）：水面下强减速熄火，1.8s 后拖车拽回最近路面点
     {
@@ -874,9 +861,10 @@ export class Game {
         }
         this.waterT = (this.waterT || 0) + dt;
         if (this.waterT > 1.8) {
+          recovered = true;
           if (this.lastRoadPos) {
             p.pos.copy(this.lastRoadPos);
-            p.pos.y = this.world ? this.world.heightAt(p.pos) : 0;
+            p.pos.y = this.heightAt(p.pos);
           }
           p.speed = 0;
           p.hint = -1;
@@ -889,8 +877,8 @@ export class Game {
         // 记录最近的安全路面点（世界路网或主赛道上都算，随时可回）
         if (this.player.pos.y > -0.5) {
           const p = this.player.pos;
-          if ((this.world && this.world.onAnyRoad(p)) || !this.track.isOffroad(p, -1).off) {
-            this.lastRoadPos = p.clone();
+          if (!this.player.offroad) {
+            this.lastRoadPos.copy(p);
           }
         }
       }
@@ -920,26 +908,38 @@ export class Game {
       this.audio.crash(res.wallHit);
     }
 
-    // ★ 车对车碰撞（v2.33 重做：双圆近似车身 + 法向弹性反弹）
-    // 旧版单圆 2.9m：车长 4.5m 导致侧面擦碰判定过晚，且只有位置糊推没有反弹 → "假"
-    // 比赛唯一推进点在此（sprint 用 updateSprint、free 用 updateTraffic，各自的模式块推进）
-    for (const ai of this.ais) {
-      if (!ai.group.visible) continue;
-      if (this.mode === 'race') ai.update(dt, this.track, this.player.total);
-      this.carVsCar(this.player, ai, true);
+    const raceLike = this.mode === 'race' || this.mode === 'time';
+    const hasOpponents = this.mode === 'race' || !!this.sprint;
+    const wet = this.player.wet || 0;
+    const worldCars = this.mode === 'free' ? [...this.traffic, ...this.ais] : this.traffic;
+    this.world.update(dt);
+    if (this.mode === 'free' || this.mode === 'collect') {
+      trafficTargets(worldCars, this.world.lights, this.world.signalAt, wet);
+      for (const car of worldCars) {
+        car.updateTraffic(dt, car.route);
+        if (Math.abs(car.pos.y - this.player.pos.y) < 2.5) this.carVsCar(this.player, car, true);
+      }
     }
-    // AI × AI（比赛/冲刺赛中互相碰撞，位置由 total 派生 → 只调 total/speed，不出音效防嘈杂）
-    if (this.ais.length >= 2 && this.mode !== 'free') {
-      for (let i = 0; i < this.ais.length; i++) {
-        for (let j = i + 1; j < this.ais.length; j++) {
-          const a = this.ais[i], b = this.ais[j];
-          if (!a.group.visible || !b.group.visible) continue;
-          this.aiVsAi(a, b);
-        }
+    if (hasOpponents) {
+      const route = this.sprint?.R ?? this.track;
+      const finish = this.sprint ? this.sprint.cps.at(-1).distance : this.track.length * this.program.laps;
+      const traffic = this.ais.map(a => ({ total: a.total, lane: a.lane, speed: a.speed, finishTime: a.finishTime }));
+      const player = this.player;
+      // A rally car on grass is still a rival; only ignore cars far off the event line.
+      if (this.onRaceLine && player.speed >= 0) {
+        const t = this.sprint ? this.raceProgress / route.length : (this.raceProgress / route.length) % 1;
+        const cp = route.curve.getPointAt(t), dir = route.curve.getTangentAt(t);
+        traffic.push({ total: this.raceProgress, lane: (player.pos.x - cp.x) * dir.z - (player.pos.z - cp.z) * dir.x,
+          speed: player.speed, finishTime: null });
+      }
+      this.ais.forEach((ai, i) => ai.updateRace(dt, route, traffic.filter((_, j) => i !== j), wet, this.elapsed, finish));
+      for (const ai of this.ais) {
+        if (Math.abs(ai.pos.y - this.player.pos.y) < 2.5) this.carVsCar(this.player, ai, true);
       }
     }
     // ★ 建筑碰撞（v2.33）：城市楼群 AABB × 玩家双圆，推出 + 法向反弹 + 音效震屏
-    this.carVsBuildings(dt);
+    this.carVsBuildings();
+    if (!this.player.group.position.equals(this.player.pos)) this.player.syncMesh();
     // 撞击震屏衰减
     this.crashShake = Math.max(0, this.crashShake - dt * 1.6);
 
@@ -963,42 +963,51 @@ export class Game {
       }
     }
 
-    // NPC 车流：红绿灯停车 + 巡航（红绿灯周期由 world.update 驱动）
-    this.world.update(dt);
-    for (const t of this.traffic) {
-      if (!t.group.visible) continue;
-      let hold = false;
-      if (this.world.isRed()) {
-        for (const L of this.world.lights) {
-          const d = t.pos.distanceTo(L.pos);
-          if (d < 18 && d > 3) { hold = true; break; }
+    const maxTravel = Math.max(Math.abs(prevSpeed), Math.abs(driveSpeed)) * dt + 2;
+    // Ignore collision separation and recovery teleports when awarding checkpoints.
+    const check = gate => recovered ? null : crossingFraction(previous, driven, gate, maxTravel);
+    if (raceLike || this.sprint) {
+      const gates = this.sprint?.cps ?? this.track.raceGates;
+      const R = this.sprint?.R ?? this.track;
+      const base = (this.lap - 1) * R.length;
+      const last = this.nextGate === 0 ? 0 : gates[this.nextGate - 1].distance;
+      const next = this.nextGate === gates.length - 1 && raceLike ? R.length : gates[this.nextGate].distance;
+      const projection = sectorProjection(R, this.player.pos, this.raceCursor, last, next, (R.width ?? 14) / 2 + 2);
+      this.onRaceLine = !!projection;
+      if (projection) {
+        this.raceCursor = projection.index;
+        this.raceProgress = base + Math.max(last, Math.min(next - 0.01, projection.distance));
+      }
+      const crossed = check(gates[this.nextGate]);
+      if (crossed !== null) {
+        this.raceProgress = base + next;
+        this.raceCursor = Math.floor((next % R.length) / R.length * (R.samples.length - 1));
+        this.nextGate++;
+        if (this.sprint) {
+          this.sprint.nextCp = this.nextGate;
+          $('collect-val').textContent = `${this.nextGate} / ${gates.length}`;
+          this.audio.beep(700 + this.nextGate * 40, 0.12, 0.2);
         }
-      }
-      t.updateTraffic(dt, t.route, hold);
-    }
-
-    // 自由漫游：环道环境车流（竞速 AI 转岗，固定车速巡航，无橡皮筋）
-    if (this.mode === 'free') {
-      for (const ai of this.ais) {
-        if (ai.group.visible) ai.updateTraffic(dt, this.track);
-      }
-    }
-
-    // 检查点 / 圈数
-    if (this.mode === 'race' || this.mode === 'time') {
-      const GT = this.track.GT || (this.track.GT = Array.from({ length: 10 }, (_, k) => k / 10));
-      const prevT = this.lastT, curT = this.player.trackT;
-      if (this.crossed(prevT, curT, GT[this.nextGate])) {
-        if (this.nextGate === 9) this.nextGate = 0;
-        else if (this.nextGate === 0) {
-          this.nextGate = 1;
+        if (this.nextGate === gates.length) {
+          if (this.sprint || this.lap === this.program.laps) {
+            this.elapsed -= dt * (1 - crossed);
+            if (hasOpponents) {
+              this.rank = 1 + this.ais.filter(a => a.finishTime != null && a.finishTime < this.elapsed).length;
+              $('rank-val').textContent = `${this.rank} / ${this.ais.length + 1}`;
+            }
+            this.finish();
+            return this.crashShake;
+          }
           this.lap++;
-          const target = this.mode === 'race' ? LAPS_RACE : 1;
-          if (this.lap > target) { this.finish(); return 0; }
+          this.nextGate = 0;
           this.toast(`第 ${this.lap} 圈！`, 1200);
-        } else this.nextGate++;
+        } else if (this.sprint) this.toast(`检查点 ${this.nextGate} / ${gates.length}`, 900);
       }
-      this.lastT = curT;
+      if (this.sprint) this.sprint.playerTotal = this.raceProgress;
+      if (hasOpponents) {
+        this.rank = 1 + this.ais.filter(a => a.finishTime != null || a.total > this.raceProgress).length;
+        $('rank-val').textContent = `${this.rank} / ${this.ais.length + 1}`;
+      }
     }
 
     // 收集挑战
@@ -1019,66 +1028,25 @@ export class Game {
       this.ringGroup.children.forEach((r) => { if (!r.userData.done) r.rotateZ(dt * 2); });
     }
 
-    // 直线加速赛：剩余距离 + 尾速统计
     if (this.mode === 'drag') {
-      this.topSpeed = Math.max(this.topSpeed, Math.abs(this.player.speed));
-      const remain = Math.max(0, this.dragEnd.distanceTo(this.player.pos));
-      $('collect-val').textContent = `${Math.round(remain)} m`;
-      if (remain < 15) {
+      const { pos, tan } = this.dragGate;
+      const remain = (pos.x - this.player.pos.x) * tan.x + (pos.z - this.player.pos.z) * tan.z;
+      $('collect-val').textContent = `${Math.max(0, Math.round(remain))} m`;
+      const crossed = check(this.dragGate);
+      if (crossed !== null) {
+        this.topSpeed = Math.max(0, prevSpeed + (driveSpeed - prevSpeed) * crossed);
+        this.elapsed -= dt * (1 - crossed);
         this.finish();
-        return Math.max(0, this.crashShake);
-      }
-    }
-
-    // ---- 冲刺/越野赛（v2.32）：玩家进度投影 + 检查点 + AI + 冲线 ----
-    if (this.mode === 'sprint' || this.mode === 'offroad') {
-      const sp = this.sprint, R = sp.R;
-      // 玩家沿路线的曲线里程：窗口最近段投影（游标 ±40 段防高速跳变，同 navTick 法）。
-      // samples 由 getPointAt 均匀参数生成 → 弧长均匀，索引 i ≈ 里程 i·per
-      const p = this.player.pos;
-      let best = Infinity, bi = sp.cursor, bt = 0;
-      const lo = Math.max(0, sp.cursor - 40), hi = Math.min(R.samples.length - 1, sp.cursor + 40);
-      for (let k = lo; k < hi; k++) {
-        const a = R.samples[k].pos, b = R.samples[k + 1].pos;
-        const dx = b.x - a.x, dz = b.z - a.z;
-        const l2 = dx * dx + dz * dz || 1;
-        let t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / l2;
-        t = Math.max(0, Math.min(1, t));
-        const d = Math.hypot(p.x - (a.x + dx * t), p.z - (a.z + dz * t));
-        if (d < best) { best = d; bi = k; bt = t; }
-      }
-      sp.cursor = bi;
-      const per = R.length / (R.samples.length - 1);
-      sp.playerTotal = Math.min(R.length, (bi + bt) * per);
-      // 检查点按序通过（进度单调 → 倒车回去再前进不会重复计数）
-      while (sp.nextCp < sp.cps.length && sp.playerTotal >= sp.cps[sp.nextCp]) {
-        sp.nextCp++;
-        this.audio.beep(700 + sp.nextCp * 40, 0.12, 0.2);
-        $('collect-val').textContent = `${sp.nextCp} / ${sp.cps.length}`;
-        if (sp.nextCp < sp.cps.length) this.toast(`检查点 ${sp.nextCp} / ${sp.cps.length}`, 900);
-        else this.toast('冲线！', 900);
-      }
-      // AI 冲线计时 + 实时名次
-      this.ais.forEach((ai) => {
-        ai.updateSprint(dt, R, sp.playerTotal);
-        if (ai.finished && ai.finishTime == null) ai.finishTime = this.elapsed;
-      });
-      const rk = 1 + this.ais.filter((a) =>
-        (a.finishTime != null && a.finishTime <= this.elapsed) ||
-        (a.finishTime == null && a.total > sp.playerTotal)).length;
-      $('rank-val').textContent = `${rk} / ${this.ais.length + 1}`;
-      // 冲线：全门通过（终点门即最后一门，位于路线 99.3% 处）
-      if (sp.nextCp >= sp.cps.length) {
-        this.finish();
-        return Math.max(0, this.crashShake);
+        return this.crashShake;
       }
     }
 
     // 自由漫游：靠近活动光柱弹报名面板；光环常转
     if (this.mode === 'free') {
-      let near = null;
+      let near = null, nearest = Infinity;
       for (const ev of this.events) {
-        if (ev.pos.distanceTo(this.player.pos) < ev.radius) { near = ev; break; }
+        const distance = ev.pos.distanceTo(this.player.pos);
+        if (distance < ev.radius && distance < nearest) { near = ev; nearest = distance; }
       }
       if (!near) this.dismissedFor = null;                 // 先判"是否真的驶出范围"
       if (near && near === this.dismissedFor) near = null; // 再过滤已忽略的活动
@@ -1100,12 +1068,7 @@ export class Game {
     const sf = $('speed-fill');
     if (sf) sf.style.width = Math.min(100, (kmh / 180) * 100) + '%'; // 速度条 0~180km/h
     $('time-val').textContent = fmtTime(this.elapsed);
-    if (this.mode === 'race' || this.mode === 'time')
-      $('lap-val').textContent = `${Math.min(this.lap, this.mode === 'race' ? LAPS_RACE : 1)} / ${this.mode === 'race' ? LAPS_RACE : 1}`;
-    if (this.mode === 'race') {
-      const rank = 1 + this.ais.filter((a) => a.group.visible && a.total > this.player.total).length;
-      $('rank-val').textContent = `${rank} / ${this.ais.length + 1}`;
-    }
+    if (raceLike) $('lap-val').textContent = `${this.lap} / ${this.program.laps}`;
     if (this.mode === 'collect')
       $('collect-val').textContent = `${this.collected} / ${this.rings.length}`;
     $('credit-val').textContent = this.credits; // v2.32 积分常显

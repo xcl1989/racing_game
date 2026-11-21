@@ -1,10 +1,11 @@
 // track.js — 大地图闭环赛道：样条曲线 → 路面几何 → 起点/检查点
 import * as THREE from 'three';
+import { gateAt } from './race-rules.js';
 import { createRoadMaterial } from './roads.js';
 import { makeAsphaltTextures, makeDirtTextures, makeCheckerTexture } from './textures.js';
 
 export const HALF_WIDTH = 7;      // 路半宽（总宽 14m，双向车道）
-export const GATE_COUNT = 10;     // 检查点数量（含起点）
+const GATE_COUNT = 10;     // 检查点数量（含起点）
 
 // 赛道控制点（大约 900m 周长的环线，跨 ±400 区域）
 const POINTS = [
@@ -126,10 +127,12 @@ export function buildTrack(scene) {
     color: 0x333333, emissive: 0xff8c1a, emissiveIntensity: 1.6, roughness: 0.4,
   });
   const gateGeo = new THREE.CylinderGeometry(0.22, 0.22, 3.2, 6);
-  for (let k = 1; k < GATE_COUNT; k++) {
+  const raceGates = [];
+  for (let k = 1; k <= GATE_COUNT; k++) {
     const t = k / GATE_COUNT;
-    const s = curve.getPointAt(t);
-    const tan = curve.getTangentAt(t).setY(0).normalize();
+    const gate = gateAt({ curve, length: trackLength }, t % 1, HALF_WIDTH + 0.5);
+    raceGates.push(gate);
+    const { pos: s, tan } = gate;
     const side = new THREE.Vector3(tan.z, 0, -tan.x);
     for (const sgn of [1, -1]) {
       const p = s.clone().addScaledVector(side, sgn * (HALF_WIDTH + 0.5));
@@ -142,7 +145,7 @@ export function buildTrack(scene) {
   scene.add(gatesGroup);
 
   // ---- 直线加速赛道（地图东南，760m 冲刺）----
-  const strip = { ax: 520, az: 140, bx: 520, bz: -620, width: 14 };
+  const strip = { ax: 520, az: 140, bx: 520, bz: -620, width: 14, length: 760, finish: 758 };
   {
     const A = new THREE.Vector3(strip.ax, 0.02, strip.az);
     const dir = new THREE.Vector3(0, 0, -1);
@@ -150,8 +153,8 @@ export function buildTrack(scene) {
     const hw = strip.width / 2;
     const L1 = A.clone().addScaledVector(side, hw);
     const R1 = A.clone().addScaledVector(side, -hw);
-    const L2 = A.clone().addScaledVector(dir, 760).addScaledVector(side, hw);
-    const R2 = A.clone().addScaledVector(dir, 760).addScaledVector(side, -hw);
+    const L2 = A.clone().addScaledVector(dir, strip.length).addScaledVector(side, hw);
+    const R2 = A.clone().addScaledVector(dir, strip.length).addScaledVector(side, -hw);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(
       [L1.x, 0.02, L1.z, R1.x, 0.02, R1.z, L2.x, 0.02, L2.z, R2.x, 0.02, R2.z], 3));
@@ -182,7 +185,7 @@ export function buildTrack(scene) {
     scene.add(stripRoad);
     // 起/终点格子线
     const checkMat = createRoadMaterial('marking', { map: makeCheckerTexture(), roughness: 0.68 });
-    for (const p of [A.clone(), A.clone().addScaledVector(dir, 758)]) {
+    for (const p of [A.clone(), A.clone().addScaledVector(dir, strip.finish)]) {
       const line = new THREE.Mesh(new THREE.PlaneGeometry(strip.width, 2.4), checkMat);
       line.rotation.x = -Math.PI / 2;
       line.position.set(p.x, 0.04, p.z);
@@ -195,6 +198,13 @@ export function buildTrack(scene) {
     const dx = strip.bx - strip.ax, dz = strip.bz - strip.az;
     const t = Math.max(0, Math.min(1, ((x - strip.ax) * dx + (z - strip.az) * dz) / (dx * dx + dz * dz)));
     return Math.hypot(x - (strip.ax + dx * t), z - (strip.az + dz * t));
+  }
+
+  function onStrip(x, z, margin = 0) {
+    const dx = strip.bx - strip.ax, dz = strip.bz - strip.az;
+    const along = ((x - strip.ax) * dx + (z - strip.az) * dz) / strip.length;
+    const side = ((x - strip.ax) * dz - (z - strip.az) * dx) / strip.length;
+    return along >= -margin && along <= strip.length + margin && Math.abs(side) <= strip.width / 2 + margin;
   }
 
   // ---- 最近样条查询（含提示加速：从上次索引附近找）----
@@ -219,25 +229,19 @@ export function buildTrack(scene) {
   const startYaw = Math.atan2(samples[0].tan.x, samples[0].tan.z);
 
   return {
-    curve, samples, SEG, length: trackLength,
-    gatesGroup, startPos, startYaw,
-    strip, distToStrip,
+    curve, samples, SEG, length: trackLength, closed: true,
+    gatesGroup, startPos, startYaw, raceGates,
+    strip, distToStrip, onStrip,
     nearestSample,
     // 判断是否冲出路面（环道或直线加速赛道）
-    // ⚠️ v2.11 修复：worldOnRoad（世界路网：高速/城市/乡道/国道/山道）此前从未被
-    //    消费——玩家在世界路上一直按越野判定（极速 60%+扬尘）。现在接上
-    // v2.20：附 surf 路面材质（'dirt' 土路 → 半越野掉速），由 world.surfaceOf 提供
     isOffroad(pos, hint) {
       const { i, d } = nearestSample(pos, hint);
-      const offRoad = d > HALF_WIDTH + 0.8;
-      const onStrip = distToStrip(pos.x, pos.z) <= strip.width / 2 + 0.6;
-      const onWorld = this.worldOnRoad ? this.worldOnRoad(pos) : false;
-      const off = offRoad && !onStrip && !onWorld;
-      // 只在"确认在世界路网上"时查材质（主环道/直线赛道围场恒为铺装）
-      const surf = (!off && !onStrip && onWorld && this.surfaceOf)
-        ? (this.surfaceOf(pos) || 'pave')
-        : 'pave';
-      return { off, surf, hint: i };
+      if (d <= HALF_WIDTH + 0.8 || onStrip(pos.x, pos.z, 0.6)) {
+        return { off: false, surf: 'pave', hint: i };
+      }
+      const surf = this.surfaceOf?.(pos) ?? null;
+      const off = surf === null;
+      return { off, surf: surf ?? 'pave', hint: i };
     },
   };
 }

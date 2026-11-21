@@ -8,6 +8,7 @@ import { DustSystem, SmokeSystem, SkidMarks, RainSystem, createComposer, EngineA
 import { initInput, input, toggleGyro, pollInput } from './input.js';
 import { Game } from './game.js';
 import { buildWorld } from './world.js';
+import { prepareTraffic } from './traffic.js';
 import { upgradeRealism } from './realism.js';
 import { setRoadWet } from './roads.js';
 import { makeGlowTexture, makeCloudTexture, createSkyPainter } from './textures.js';
@@ -118,7 +119,6 @@ track.railGroup = scenery.railGroup; // 护栏组：比赛显示/漫游隐藏
 track.railGroup.visible = false;
 upgradeRealism(scene); // v2.15：地面/远山/雾 材质真实化（构建后遍历升级，不动生成代码）
 // 玩家在世界路网（高速/乡道/城市街道）上不算越野
-track.worldOnRoad = (pos) => world.onAnyRoad(pos);
 // v2.20 越野分级：提供路面材质（'dirt' 土路半越野 / 'pave' 铺装）
 track.surfaceOf = (pos) => world.surfaceAt(pos);
 
@@ -188,7 +188,7 @@ ais.forEach((a) => { a.group.visible = false; scene.add(a.group); });
 
 // ---- NPC 车流（v2.19 重做）：分散全图 + 加量 ----
 // 每条路线多台车按"均匀分槽+随机抖动"相位分布（startT），不再全堆在路线起点；
-// 桌面 ~29 台 / 手机 ~15 台（isMobile 减半保帧率）
+// 移动端减量，但保留每类道路的代表车流。
 const traffic = [];
 {
   const rnd = (a, b) => a + Math.random() * (b - a);
@@ -197,15 +197,15 @@ const traffic = [];
     0x6a7d5a, 0x4d5665, 0x8a7f6a, 0x557f6f, 0x6b5d7a, 0x5d6b7a, 0x8a6a52,
     0x46586e, 0x9a8a6a,
   ];
-  // T(路线, 台数, [最低,最高]车速, 车道或(dir→车道), 是否双向)
+  // T(路线, 台数, [最低,最高]车速, 车道偏移, 是否双向)
   const q = isMobile ? 0.45 : 1;
-  const T = (route, count, sp, laneOf, twoWay = false) => {
+  const T = (route, count, sp, lane, twoWay = false) => {
     const n = Math.max(1, Math.round(count * q));
     for (let k = 0; k < n; k++) {
       const dir = twoWay ? (k % 2 === 0 ? 1 : -1) : 1;
       traffic.push(new AICar(
         palette[traffic.length % palette.length],
-        typeof laneOf === 'function' ? laneOf(dir) : laneOf,
+        lane,
         rnd(sp[0], sp[1]),
         ferrariTemplate,
         route,
@@ -215,17 +215,21 @@ const traffic = [];
     }
   };
   T(world.highway, 7, [26, 33], -2.6, true); // 高速双向
-  T(world.cityRoute, 5, [11, 15], () => (traffic.length % 2 === 0 ? -3 : 3)); // 城市环线（会等红灯）
-  T(world.country, 3, [12, 16], () => 2);                          // 乡道土路
-  T(world.national, 4, [18, 22], (d) => (d === 1 ? 4 : -4), true); // 国道双向
-  T(world.lakeRoad, 2, [12, 15], () => 2);                         // 湖滨路
-  T(world.mountainRoad, 2, [9, 12], () => 2.2);                    // 盘山慢车
-  T(world.westLake, 2, [13, 16], () => 2);                         // 湖西环路
+  T(world.cityRoute, 5, [11, 15], -2.2, true); // 城市环线（会等红灯）
+  T(world.country, 3, [12, 16], -2);                          // 乡道土路
+  T(world.national, 4, [18, 22], -2.6, true); // 国道双向
+  T(world.lakeRoad, 2, [12, 15], -2);                         // 湖滨路
+  T(world.mountainRoad, 2, [9, 12], -2.2);                    // 盘山慢车
+  T(world.westLake, 2, [13, 16], -2);                         // 湖西环路
   T(world.northInterchange.traffic, 1, [26, 29], 0);                        // 北大道通勤
-  T(world.eastConn, 1, [24, 27], () => 3);                         // 东连接大道
-  T(world.southConn, 1, [22, 26], () => 3);                        // 南连接大道
-  T(world.swLink, 1, [20, 24], () => 3);                           // 西南连接线
+  T(world.eastConn, 1, [24, 27], -3);                         // 东连接大道
+  T(world.southConn, 1, [22, 26], -3);                        // 南连接大道
+  T(world.summitRing, 1, [8, 10], -2);
+  T(world.roundabout, 1, [7, 9], -2);
+  T(world.trail, 1, [7, 10], 0);
+  T(world.swLink, 1, [20, 24], -2.4);                           // 西南连接线
 }
+for (const route of new Set([...traffic.map(t => t.route), track])) prepareTraffic(route);
 traffic.forEach((t) => { t.group.visible = false; scene.add(t.group); });
 
 const dust = new DustSystem(scene);
@@ -564,7 +568,10 @@ function closeSelectUI() {
 function enterFree(spec, msg) {
   game.startMode('free');
   const pos = game._savedPos;
-  if (pos) player.reset(new THREE.Vector3(pos.x, 0, pos.z), pos.yaw);
+  if (pos) {
+    player.reset(new THREE.Vector3(pos.x, game.heightAt(pos), pos.z), pos.yaw);
+    if (!track.isOffroad(player.pos, -1).off) game.lastRoadPos.copy(player.pos);
+  }
   $('mode-val').textContent = `自由漫游 · ${spec.name}`;
   game.toast(msg, 3200);
   updateMenuButtons();

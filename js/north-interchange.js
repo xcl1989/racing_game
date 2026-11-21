@@ -216,5 +216,5 @@ export function buildNorthInterchange(highway, cityZ) {
     .map(range => range.map(s => Math.round(s / length * n)));
   const replacesCurb = i => curbGaps.some(([a, b]) => i >= a - 1 && i <= b);
   return { group, lanes, minimap, contains, distance, replacesCurb,
-    traffic: { curve: commute, length: total, speedAt } };
+    traffic: { curve: commute, length: total, closed: true, speedAt } };
 }

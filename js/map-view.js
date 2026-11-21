@@ -242,6 +242,9 @@ export class MapView {
       if (activeNav && Math.hypot(e.pos.x - nav.dest.x, e.pos.z - nav.dest.z) < 12) continue;
       if (!activeNav || overview) dot(e.pos.x, e.pos.z, e.mapColor, overview ? 2.6 : 3.2, true);
     }
+    const raceGates = sprint?.cps ?? ((mode === 'race' || mode === 'time') ? game.track.raceGates : null);
+    const next = raceGates?.[game.nextGate];
+    if (next) dot(next.pos.x, next.pos.z, '#ffda7e', 4, true);
     if (game.ringGroup.visible) for (const r of game.rings) {
       if (!r.userData.done) dot(r.position.x, r.position.z, '#47e2f2', 2.4);
     }
