@@ -1,3 +1,5 @@
+import { Color } from 'three';
+import { terrainTint } from './world-surface-finish.js';
 import { LAKE, FOOTHILL_LAKE, RIVER } from './world-guide.js';
 
 const S = 1024;
@@ -120,6 +122,7 @@ export class MapView {
     const tile = document.createElement('canvas');
     tile.width = tile.height = n;
     const tc = tile.getContext('2d'), image = tc.createImageData(n, n);
+    const tint = new Color();
     for (let row = 0, i = 0; row < n; row++) for (let col = 0; col < n; col++, i += 4) {
       const [x, z] = this.unproject((col + .5) * S / n, (row + .5) * S / n);
       const h = sampleTerrain(x, z);
@@ -129,8 +132,11 @@ export class MapView {
       const grain = Math.sin(x * .062 + Math.sin(z * .085)) * Math.sin(z * .067) * 1.3;
       const fields = Math.sin(x * .003 + Math.cos(z * .002)) * 3 + Math.cos(z * .0038 - x * .002) * 4;
       const light = 6 * Math.max(0, h) / 72 + relief + fields + grain;
-      image.data[i] = 56 + light; image.data[i+1] = 69 + light;
-      image.data[i+2] = 56 + light * .7; image.data[i+3] = 255;
+      terrainTint(x, z, h, Math.hypot(dx, dz) / (step * 2), tint);
+      image.data[i] = 56 + light + (tint.r - .88) * 27;
+      image.data[i+1] = 69 + light + (tint.g - .87) * 32;
+      image.data[i+2] = 56 + light * .7 + (tint.b - .77) * 34;
+      image.data[i+3] = 255;
     }
     tc.putImageData(image, 0, 0);
     ctx.drawImage(tile, 0, 0, S, S);

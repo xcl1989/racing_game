@@ -8,11 +8,16 @@
 // 消费方：world.js（河/湖2/公园水池）、scenery.js（湖1）。
 // 每帧由 world.update() 调 updateWater(t) 推进波浪相位并滚动法线贴图。
 import * as THREE from 'three';
+import { SUN_DIRECTION } from './environment.js';
 
 const waterMats = []; // { mat, normalTex, scrollA:[sx,sy], scrollB:[sx,sy] }
 
-// 太阳方向（与 main.js 太阳 sprite (700,900,-600) 同源，归一化后指向太阳）
-const SUN_DIR = new THREE.Vector3(700, 900, -600).normalize();
+const sunColor = { value: new THREE.Color(0xffe7c7) };
+const sunStrength = { value: 1 };
+export function setWaterSun(color, strength) {
+  sunColor.value.copy(color);
+  sunStrength.value = THREE.MathUtils.clamp(strength, 0, 1);
+}
 
 const _v = /* glsl */ `
   uniform float uTime;
@@ -30,6 +35,7 @@ const _v = /* glsl */ `
 const _f = /* glsl */ `
   uniform vec3 uSunDir;        // 指向太阳（已归一化）
   uniform vec3 uSunColor;
+  uniform float uSunStrength;
   uniform vec3 uShallow;       // 水线浅水色
   uniform vec3 uFoamC;         // 泡沫白
   uniform float uFoamK;        // 泡沫强度 0..1
@@ -80,8 +86,9 @@ export function makeWaterMaterial({
     uShoreR: { value: shoreR },
     uBand: { value: band },
     uFoamBand: { value: foamBand },
-    uSunDir: { value: SUN_DIR.clone() },
-    uSunColor: { value: new THREE.Color(0xfff0d0) },
+    uSunDir: { value: SUN_DIRECTION },
+    uSunColor: sunColor,
+    uSunStrength: sunStrength,
     uShallow: { value: new THREE.Color(shallow) },
     uFoamC: { value: new THREE.Color(0xeef6f2) },
     uFoamK: { value: foam },
@@ -129,6 +136,7 @@ export function makeWaterMaterial({
           float jitter = sin(vWorldPos.x * 0.9 + vWorldPos.z * 1.3 - uTime * 2.1) * 0.5
             + sin(vWorldPos.x * 0.31 - vWorldPos.z * 0.47 + uTime * 1.4) * 0.5;
           float foamT = 1.0 - smoothstep(0.1, uFoamBand, vShore + jitter * uFoamBand * 0.35);
+          foamT *= mix(0.24, 1.0, smoothstep(-0.45, 0.55, jitter));
           foamT = clamp(foamT * uFoamK * (0.7 + 0.3 * jitter), 0.0, 1.0);
           diffuseColor.rgb = mix(diffuseColor.rgb, uFoamC.rgb, foamT);
         }
@@ -141,15 +149,15 @@ export function makeWaterMaterial({
           vec3 wn = inverseTransformDirection(normal, viewMatrix);
           vec3 viewDirW = normalize(cameraPosition - vWorldPos);
           float fres = pow(1.0 - clamp(dot(viewDirW, wn), 0.0, 1.0), 5.0);
-          reflectedLight.indirectSpecular *= (1.0 + fres * 1.3);
+          reflectedLight.indirectSpecular *= (1.0 + fres * .82);
           // 太阳高光条
           vec3 refl = reflect(-viewDirW, wn);
           float glintT = pow(clamp(dot(refl, uSunDir), 0.0, 1.0), 160.0);
-          reflectedLight.directSpecular += uSunColor * glintT * uGlint * (0.25 + fres);
+          reflectedLight.directSpecular += uSunColor * glintT * uGlint * uSunStrength * (0.25 + fres);
         }
       `);
   };
-  m.customProgramCacheKey = () => 'water-v1';
+  m.customProgramCacheKey = () => 'water-v2';
   waterMats.push({
     mat: m,
     normalTex,

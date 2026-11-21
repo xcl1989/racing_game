@@ -218,12 +218,12 @@ const traffic = [];
   T(world.cityRoute, 5, [11, 15], -2.2, true); // 城市环线（会等红灯）
   T(world.country, 3, [12, 16], -2);                          // 乡道土路
   T(world.national, 4, [18, 22], -2.6, true); // 国道双向
-  T(world.lakeRoad, 2, [12, 15], -2);                         // 湖滨路
+  T(world.approachTraffic.lake, 2, [13, 16], -2.2, true); // 湖滨双向巡航
   T(world.mountainRoad, 2, [9, 12], -2.2);                    // 盘山慢车
   T(world.westLake, 2, [13, 16], -2);                         // 湖西环路
   T(world.northInterchange.traffic, 1, [26, 29], 0);                        // 北大道通勤
-  T(world.eastConn, 1, [24, 27], -3);                         // 东连接大道
-  T(world.southConn, 1, [22, 26], -3);                        // 南连接大道
+  T(world.approachTraffic.east, 1, [17, 20], -2.7); // 东环联络线
+  T(world.approachTraffic.belt, 1, [17, 20], -2.7); // 西北联络线
   T(world.summitRing, 1, [8, 10], -2);
   T(world.roundabout, 1, [7, 9], -2);
   T(world.trail, 1, [7, 10], 0);

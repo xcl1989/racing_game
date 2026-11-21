@@ -7,6 +7,8 @@ import {
 } from './textures.js';
 import { addMirrorLakePlanting, ageMirrorLakePaint, shadeMirrorLake } from './lake-detail.js';
 import { firCrown } from './scene-detail.js';
+import { addSurfaceFinish, terrainTint } from './world-surface-finish.js';
+import { addRegionScenery } from './region-scenery.js';
 import { LAKE } from './world-guide.js';
 import { HALF_WIDTH } from './track.js';
 import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
@@ -50,29 +52,8 @@ export function buildScenery(scene, track, world, rich = true) {
       const x = pos.getX(i), z = pos.getZ(i);
       const h = world.sampleTerrain(x, z); // 与物理 heightAt 同源（烘焙双线性），地形/车/植被四方一致
       pos.setY(i, h); // 山体隆起 + 河湖下切（与物理同一函数）
-      // 多频正弦叠加 = 平滑的草地色块起伏（亮绿↔暗绿↔微黄）
-      const n1 = Math.sin(x * 0.0045) * Math.cos(z * 0.0035);
-      const n2 = Math.sin((x + z) * 0.0016);
-      const shade = 0.82 + n1 * 0.13 + n2 * 0.1;
-      let r = shade * 1.02, g = shade, b = shade * 0.78;
-      // v2.12.1 岸线成形：仅在水域邻近带内按高度着色——岸坡露沙、水线以下湿泥，
-      // 不再让绿草直插水面（否则湖观感像贴在草地上的浅色平地）
-      const dL1 = Math.hypot(x - 660, z + 560);        // 湖1（盆缘 146）
-      const dL2 = Math.hypot(x + 1500, z + 1900);      // 湖2（盆缘 205）
-      const dR = Math.abs(x + 900);                    // 河道（岸坡外缘 42）
-      if ((dL1 < 150 || dL2 < 215 || dR < 55) && h < 0.35) {
-        const sand = 1 - THREE.MathUtils.smoothstep(h, -1.6, 0.35); // 越低越沙
-        const wet = 1 - THREE.MathUtils.smoothstep(h, -1.7, -0.5);  // 水线以下湿泥
-        const sr = 0.78 * (1 - wet) + 0.4 * wet;   // 沙(0.78,0.69,0.5) → 湿泥(0.4,0.35,0.27)
-        const sg = 0.69 * (1 - wet) + 0.35 * wet;
-        const sb = 0.5 * (1 - wet) + 0.27 * wet;
-        r = r * (1 - sand) + sr * sand;
-        g = g * (1 - sand) + sg * sand;
-        b = b * (1 - sand) + sb * sand;
-      }
-      colors[i * 3] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
+      const slope = Math.hypot(TH(x+22,z)-TH(x-22,z), TH(x,z+22)-TH(x,z-22)) / 44;
+      terrainTint(x,z,h,slope,tmpColor).toArray(colors,i*3);
     }
     groundGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     groundGeo.computeVertexNormals();
@@ -84,6 +65,7 @@ export function buildScenery(scene, track, world, rich = true) {
   }));
   ground.receiveShadow = true;
   shadeMirrorLake(ground.material, world.westLake);
+  addSurfaceFinish(ground.material, 'terrain');
   scene.add(ground);
   ageMirrorLakePaint(world.westLake.mesh.material);
 
@@ -97,7 +79,7 @@ export function buildScenery(scene, track, world, rich = true) {
     const lake = new THREE.Mesh(
       new THREE.PlaneGeometry(330, 330, 64, 64),
       makeWaterMaterial({
-        deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.95,
+        deep: 0x164859, shallow: 0x4b7a71, foam: .28, glint: .73,
         shoreMode: 'circle', center: [lakePos.x, lakePos.z], shoreR: lakePos.r,
         band: 26, foamBand: 3.5, waveAmp: 0.06,
         normalTex: lakeNormal, normalScale: 0.4, repeat: 23,
@@ -108,7 +90,7 @@ export function buildScenery(scene, track, world, rich = true) {
     scene.add(lake);
 
     // 湖畔木栈桥（从东北岸伸向湖心：架高板道 + 长桩入水触底）
-    const woodMat = new THREE.MeshStandardMaterial({ color: 0x8a6a48, roughness: 0.9 });
+    const woodMat = addSurfaceFinish(new THREE.MeshStandardMaterial({ color: 0x8a6a48, roughness: .90 }), 'bark');
     const pier = new THREE.Group();
     const deck = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.22, 62), woodMat);
     deck.position.set(0, 0.75, 0);
@@ -148,7 +130,7 @@ export function buildScenery(scene, track, world, rich = true) {
     }
 
     // 湖畔农舍三栋（红墙白窗 + 坡顶，散在环岛西侧的坡地上）
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0xb04a3a, roughness: 0.85 });
+    const wallMat = addSurfaceFinish(new THREE.MeshStandardMaterial({ color: 0xa24d39, roughness: .90 }), 'stone');
     const roofMat = new THREE.MeshStandardMaterial({ color: 0x4a3f38, roughness: 0.9 });
     const glassMat = new THREE.MeshStandardMaterial({
       color: 0x88a8c0, roughness: 0.2, metalness: 0.6, envMapIntensity: 1.2,
@@ -339,7 +321,7 @@ export function buildScenery(scene, track, world, rich = true) {
     barkPos.setX(i, barkPos.getX(i) + 0.09 * Math.sin((y + 1.3) * 0.9));
   }
   trunkGeo.computeVertexNormals();
-  const trunkMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 });
+  const trunkMat = addSurfaceFinish(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }), 'bark');
   const trunk = new THREE.InstancedMesh(trunkGeo, trunkMat, N_TREE); // v2.13 instanceColor 染干
   const canopy = new THREE.InstancedMesh(leafGeo,
     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: foliageTex }), N_TREE * 4);
@@ -449,7 +431,7 @@ export function buildScenery(scene, track, world, rich = true) {
   const N_ROCK = Math.round(230 * D);
   const rockGeo = new THREE.IcosahedronGeometry(1, 0);
   const rocks = new THREE.InstancedMesh(rockGeo,
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }), N_ROCK);
+    addSurfaceFinish(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: .95, flatShading: true }), 'stone'), N_ROCK);
   placed = 0; tries = 0;
   while (placed < N_ROCK && tries < 3000) {
     tries++;
@@ -1053,6 +1035,8 @@ export function buildScenery(scene, track, world, rich = true) {
 
   // ---- 每帧动画（风机叶片 / 飞鸟盘旋）----
   let birdT = 0;
+  addRegionScenery(scene, track, world, rich);
+
   function update(dt) {
     for (const r of rotors) r.rotation.z += dt * r.userData.speed;
     birdT += dt;

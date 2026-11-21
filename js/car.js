@@ -169,60 +169,69 @@ export function loadCarTemplate(url = 'models/ferrari.glb', onProgress = null, o
 }
 
 // 克隆模板并按名字换材质（车身漆/玻璃/轮毂）
-const glassMat = new THREE.MeshPhysicalMaterial({
+// Traffic uses the existing lightweight shared look; detailed materials are for the player.
+const trafficGlass = new THREE.MeshPhysicalMaterial({
   color: 0x18273a, metalness: 0.1, roughness: 0.05,
   transparent: true, opacity: 0.85, envMapIntensity: 2.4,
 });
-const rimMat = new THREE.MeshStandardMaterial({ color: 0xd6d9dd, metalness: 1.0, roughness: 0.22 });
+const trafficRim = new THREE.MeshStandardMaterial({ color: 0xd6d9dd, metalness: 1, roughness: .22 });
+// Match audited GLB material names, not broad mesh names (which include lamps,
+// interior trim and carbon pieces on several models).
 const PARTS = {
   ferrari: { paint: /^(body_color|_0098_dodgerblue)$/, glass: /^glass_gray$/, rubber: /^tires$/, trim: /^plastic_gray$/ },
-  yu7: { paint: /^carpaint$/, glass: /^(windows|d_glass)$/, rubber: /^tyre_3$/, rim: /^(yu7rim_c1|rim_c2)$/, trim: /^(plastic_sh|black_mat|dark_gray_map)$/ },
-  jeep392: { paint: /^jmi_1355060001_004$/, glass: /^glass$/, lens: /^(red_glass|orange_glass)$/, rim: /^jmi_rim_002$/, trim: /^jmi_plastic1$/ },
+  tesla: { paint: /^car_paint$/, glass: /^windows$/, rubber: /^tyre$/, rim: /^material(?:\.001)?$/ },
+  porsche: { paint: /^paint$/, glass: /^window$/, rubber: /^rubber$/ },
+  su7: { paint: /^untitledmat_carpaint_su7_base1$/, glass: /^untitledmat_glass_231$/, rim: /^untitledmat_tire_hub_127$/, trim: /^untitledmat_carpaint_base_black1$/ },
+  g63: { paint: /^mmat_carpaint_010$/, glass: /^mmat_glass1$/, rim: /^mmat_tire_hub1$/ },
+  concept: { paint: /^paint 1 (carmine|pearl|graphite)$/, accent: /^paint 2 (carmine|pearl|graphite)$/, glass: /^glass$/, rubber: /^tire(side|tread)$/, rim: /^rim[12]$/ },
+  m4: { paint: /^meshesbody151mtl$/, glass: /^mesheswindows1mtl$/, rim: /^meshesm8rim(001)?1mtl$/ },
+  m2g87: { paint: /2023paint_material1$/, glass: /window_material1$/ },
+  jeep392: { paint: /^jmi_1355060001_004$/, glass: /^glass$/, lens: /^(red_glass|orange_glass)$/, rim: /^jmi_rim_002$/, rubber: /^jmi_plastic1$/ },
+  yu7: { paint: /^carpaint$/, glass: /^windows$/, lens: /^(d_glass|light_glass)$/, rubber: /^tyre_3$/, rim: /^(yu7rim_c1|rim_c2)$/, trim: /^(plastic_sh|black_mat|dark_gray_map)$/ },
+  su7ultra: { paint: /^carpaint$/, glass: /^(windows|roof_glass)$/, lens: /^d_glass$/, rubber: /^tire$/, rim: /^(rim_1|color_rim)$/, trim: /^matte_black$/ },
 };
-
-const FERRARI_FINISH = {
-  paint: { metalness: 0.09, roughness: 0.42, clearcoat: 0.68,
-    clearcoatRoughness: 0.21, envMapIntensity: 1.02 },
-  glass: { roughness: 0.22, opacity: 0.81, envMapIntensity: 1.02 },
-  rubber: { roughness: 0.92, envMapIntensity: 0.36 },
+const PAINT = { metalness: .12, roughness: .36, clearcoat: .76, clearcoatRoughness: .17, envMapIntensity: 1.12, specularIntensity: .86 };
+const PAINT_FINISH = {
+  ferrari: { metalness: .09, roughness: .42, clearcoat: .68, clearcoatRoughness: .21, envMapIntensity: 1.02 },
+  tesla: { roughness: .38, clearcoatRoughness: .19 },
+  porsche: { metalness: .07, roughness: .34, clearcoatRoughness: .15 },
+  g63: { roughness: .43, clearcoat: .58, clearcoatRoughness: .22 },
+  concept: { metalness: .24, roughness: .31, clearcoatRoughness: .14 },
+  jeep392: { metalness: .06, roughness: .47, clearcoat: .46, clearcoatRoughness: .27 },
+  yu7: { metalness: .09, roughness: .39, clearcoatRoughness: .19 },
+  su7ultra: { metalness: .10, roughness: .35, clearcoatRoughness: .15 },
 };
 
 function tuneCarPart(source, role, paintColor, modelId) {
   let mat;
-  if ((role === 'paint' || role === 'glass') && !source.isMeshPhysicalMaterial) {
+  if ((role === 'paint' || role === 'accent' || role === 'glass') && !source.isMeshPhysicalMaterial) {
     mat = new THREE.MeshPhysicalMaterial();
-    // Copy the standard PBR channels and render state without dropping source maps.
     THREE.MeshStandardMaterial.prototype.copy.call(mat, source);
     mat.defines = { STANDARD: '', PHYSICAL: '' };
   } else {
     mat = source.clone();
   }
-  if (role === 'paint') {
-    mat.color.copy(paintColor);
-    Object.assign(mat, { metalness: 0.12, roughness: mat.roughnessMap ? 0.48 : 0.35,
-      clearcoat: 0.82, clearcoatRoughness: 0.14, envMapIntensity: 1.22, specularIntensity: 0.85 });
+  if (role === 'paint' || role === 'accent') {
+    // Textured paint may already encode the factory color and graphics (SU7 Ultra).
+    if (role === 'paint' && !mat.map) mat.color.copy(paintColor);
+    Object.assign(mat, PAINT, PAINT_FINISH[modelId]);
+    if (mat.roughnessMap) mat.roughness = Math.max(.48, mat.roughness);
   } else if (role === 'glass') {
-    // Tinted glazing with a single transparent layer; avoid another scene transmission pass.
-    mat.color.setHex(0x263541);
-    Object.assign(mat, { transmission: 0, metalness: 0, roughness: 0.16,
-      transparent: true, opacity: 0.76, depthWrite: false, envMapIntensity: 1.25 });
+    if (!mat.map) mat.color.setHex(modelId === 'ferrari' ? 0x27343c : 0x273846);
+    Object.assign(mat, { transmission: 0, metalness: 0, roughness: modelId === 'ferrari' ? .22 : .18,
+      transparent: true, opacity: modelId === 'ferrari' ? .81 : .79, depthWrite: false, envMapIntensity: 1.05 });
   } else if (role === 'lens') {
-    // Keep the source tint without a full-scene transmission pass for small lenses.
-    Object.assign(mat, { transmission: 0, roughness: 0.22, transparent: true,
-      opacity: 0.72, depthWrite: false });
+    // Preserve the original tint, decals and emissive channel on lens materials.
+    if (mat.transmission > 0) Object.assign(mat, { transmission: 0, transparent: true, opacity: .72, depthWrite: false });
+    mat.roughness = Math.max(.22, mat.roughness);
   } else if (role === 'rubber') {
-    Object.assign(mat, { metalness: 0, roughness: 0.96, envMapIntensity: 0.42 });
+    Object.assign(mat, { metalness: 0, roughness: modelId === 'ferrari' ? .92 : .96, envMapIntensity: .36 });
   } else if (role === 'rim') {
-    Object.assign(mat, { metalness: 0.74, roughness: 0.34, envMapIntensity: 1 });
+    Object.assign(mat, { metalness: .7, roughness: .34, envMapIntensity: .94 });
   } else {
-    Object.assign(mat, { metalness: 0, roughness: 0.72, envMapIntensity: 0.65 });
+    Object.assign(mat, { metalness: 0, roughness: .76, envMapIntensity: .59 });
   }
-  if (modelId === 'ferrari' && Object.hasOwn(FERRARI_FINISH, role)) {
-    const finish = FERRARI_FINISH[role];
-    Object.assign(mat, finish);
-    if (role === 'paint' && mat.roughnessMap) mat.roughness = 0.48;
-    if (role === 'glass') mat.color.setHex(0x27343c);
-  }
+  mat.userData.finishRole = role;
   return mat;
 }
 
@@ -236,48 +245,45 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
     paintColor.getHSL(hsl);
     paintColor.setHSL(hsl.h, Math.min(1, hsl.s * 1.05), Math.min(0.9, hsl.l * 1.18 + 0.02));
   }
-  const parts = Object.hasOwn(PARTS, wheelOpts?.id) ? PARTS[wheelOpts.id] : null;
+  const modelId = wheelOpts?.id;
+  const parts = Object.hasOwn(PARTS, modelId) ? PARTS[modelId] : null;
   const partMaterials = new Map();
-  const ownedMaterials = new Set();
-  let paint = parts ? null : new THREE.MeshPhysicalMaterial({
-    // v2.31 车漆修正：旧配方 metalness 0.75 会让漫反射几乎归零（金属只有镜面反射），
-    // 深色漆只剩天空反射 → 整台车发黑。改成与程序化车模 paintMat 一致的
-    // "介电底漆 + 清漆"：底色漆金属度 0.15 保住饱和度与明度，清漆层负责天空反射高光。
-    color: paintColor, metalness: 0.15, roughness: 0.30,
-    clearcoat: 1.0, clearcoatRoughness: 0.06, envMapIntensity: 1.35,
-  });
-  if (paint) ownedMaterials.add(paint);
+  const isTraffic = wheelOpts?.traffic === true;
+  const trafficPaint = isTraffic ? new THREE.MeshPhysicalMaterial({
+    color: paintColor, metalness: .15, roughness: .30,
+    clearcoat: 1, clearcoatRoughness: .06, envMapIntensity: 1.35,
+  }) : null;
+  let paint = trafficPaint;
   group.traverse((o) => {
     if (!o.isMesh) return;
     o.castShadow = true;
-    if (parts) {
-      const tune = (source) => {
-        if (!source?.isMeshStandardMaterial) return source;
-        const name = source.name.toLowerCase();
-        let role = Object.keys(parts).find((k) => parts[k].test(name));
-        if (wheelOpts.id === 'jeep392' && /ani_wheel/i.test(o.name) && role === 'trim') role = 'rubber';
-        if (wheelOpts.id === 'ferrari' && /^rim(?:_|$)/i.test(o.name) && name === 'metal_gray') role = 'rim';
-        if (!role) return source;
-        const key = source.uuid + ':' + role;
-        if (!partMaterials.has(key)) {
-          const mat = tuneCarPart(source, role, paintColor, wheelOpts.id);
-          partMaterials.set(key, mat);
-          ownedMaterials.add(mat);
-          if (role === 'paint') paint ||= mat;
-        }
-        return partMaterials.get(key);
-      };
-      o.material = Array.isArray(o.material) ? o.material.map(tune) : tune(o.material);
+    if (isTraffic) {
+      const n = o.name.toLowerCase();
+      const name = (Array.isArray(o.material) ? o.material[0] : o.material)?.name.toLowerCase() ?? '';
+      if (n.includes('body') || n === 'blue' || name.includes('paint') || name.includes('body')) o.material = trafficPaint;
+      else if (n.includes('glass') || name.includes('window') || name.includes('glass')) o.material = trafficGlass;
+      else if (splitTokens(n).includes('rim')) o.material = trafficRim;
       return;
     }
-    const n = (o.name || '').toLowerCase();
-    const mn = (Array.isArray(o.material) ? o.material[0]?.name : o.material?.name || '').toLowerCase();
-    // 车漆匹配：'blue' 是 ferrari 的第二块喷漆面板；'paint' 是 tesla/g63 的 car_paint；
-    // 'body'（v2.16.1 加材质名）：BMW M4 网格名全是 Object_*，车漆在材质 Meshesbody151Mtl 上
-    if (n.includes('body') || n === 'blue' || mn.includes('paint') || mn.includes('body')) o.material = paint;
-    // 玻璃匹配：ferrari 按网格名，tesla 按材质名 'windows'
-    else if (n.includes('glass') || mn.includes('window') || mn.includes('glass')) o.material = glassMat;
-    else if (splitTokens(n).includes('rim')) o.material = rimMat;
+    if (!parts) return;
+    const tune = (source) => {
+      if (!source?.isMeshStandardMaterial) return source;
+      const name = source.name.toLowerCase();
+      let role = Object.keys(parts).find((key) => parts[key].test(name));
+      if (modelId === 'ferrari' && /^rim(?:_|$)/i.test(o.name) && name === 'metal_gray') role = 'rim';
+      if (modelId === 'tesla' && role === 'rim' && !/hub|rim/i.test(o.name)) role = null;
+      if (modelId === 'porsche' && name === 'silver' && splitTokens(o.name).includes('rim')) role = 'rim';
+      if (modelId === 'su7ultra' && role === 'rim' && /wheelplastic/i.test(o.name)) role = 'trim';
+      if (!role) return source;
+      const key = source.uuid + ':' + role;
+      if (!partMaterials.has(key)) {
+        const mat = tuneCarPart(source, role, paintColor, modelId);
+        partMaterials.set(key, mat);
+        if (role === 'paint') paint ||= mat;
+      }
+      return partMaterials.get(key);
+    };
+    o.material = Array.isArray(o.material) ? o.material.map(tune) : tune(o.material);
   });
   // 轮子收集（两层结构：wheels = 每轮一组）：
   // 1) 名字 token 精确匹配 wheel/rim/tyre/tire（裸 includes 会误伤 'trim'→'rim'、
@@ -396,11 +402,12 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
     }
     return { meshes: rolling, static: statics, steer: i < 2 };
   });
-  const contact = addContactShadow(group, parts ? groups : null);
+  const contact = addContactShadow(group, wheelOpts?.closeup ? groups : null);
   return { group, wheels, paint, dispose() {
     contact.geometry.dispose();
     contact.material.dispose();
-    for (const mat of ownedMaterials) mat.dispose();
+    trafficPaint?.dispose();
+    for (const mat of partMaterials.values()) mat.dispose();
   } };
 }
 
@@ -442,7 +449,7 @@ function addContactShadow(group, wheelGroups) {
 // ---- 玩家车：街机物理（参数来自 spec：极速/加速/刹车/操控）----
 export class PlayerCar {
   constructor(spec, template = null) {
-    const built = template ? createCarFromTemplate(template, spec.color, spec) : buildCarModel(spec);
+    const built = template ? createCarFromTemplate(template, spec.color, { ...spec, closeup: true }) : buildCarModel(spec);
     this.group = built.group;
     // 轮子结构归一化（同 AICar：程序化兜底车是裸 Mesh）
     this.wheels = (built.wheels || []).map((w, i) =>
@@ -466,7 +473,7 @@ export class PlayerCar {
 
   // 换车：重建车模（保留位置朝向），更新物理 spec
   applySpec(spec, template = null) {
-    const built = template ? createCarFromTemplate(template, spec.color, spec) : buildCarModel(spec);
+    const built = template ? createCarFromTemplate(template, spec.color, { ...spec, closeup: true }) : buildCarModel(spec);
     const old = this.group;
     const parent = old.parent; // ⚠️ 先存父引用：remove(old) 会把 old.parent 置 null
     this.group = built.group;
@@ -636,7 +643,7 @@ export class PlayerCar {
 // env = 任何有 {curve, length} 的路线（环道 / 高速 / 城市 / 乡道），dir=±1 双向行驶
 export class AICar {
   constructor(color, lane, baseSpeed, template = null, route = null, dir = 1, startT = 0) {
-    const built = template ? createCarFromTemplate(template, color) : buildCarModel({ id: 'ferrari', color });
+    const built = template ? createCarFromTemplate(template, color, { traffic: true }) : buildCarModel({ id: 'ferrari', color });
     this.group = built.group;
     // 轮子结构归一化：真车模是 {meshes,steer} 组，程序化兜底车是裸 Mesh
     // （不归一会让 placeOn/update 的 w.meshes 遍历在无 GLB 环境直接崩帧）

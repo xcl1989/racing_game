@@ -104,17 +104,11 @@ export function roadOverlapsBox(samples, x, z, hw, hd, margin = 0) {
 
 // Each entry is an independently reviewed at-grade junction, not a proximity rule.
 export const ROAD_JUNCTIONS = [
-  ['highway', 'eastConn', 1860, 360], ['highway', 'southConn', 806, 1015],
   ['highway', 'national', -615, 341], ['highway', 'mountainRoad', 690, -870],
   ['highway', 'westLake', 612, -862], ['highway', 'swLink', -320, -536],
   ['highway', 'country', -659, 51], ['highway', 'country', -619, -171],
   ['eastConn', 'city7', 1296, 350], ['southConn', 'city2', 1050, 616],
-  ['lakeRoad', 'roundabout', 820, -400], ['lakeRoad', 'city1', 930, 612],
-  ['lakeRoad', 'city5', 853, 90], ['lakeRoad', 'city6', 868, 220],
-  ['lakeRoad', 'city7', 886, 350], ['lakeRoad', 'city8', 906, 480],
-  ['lakeRoad', 'city9', 930, 610], ['lakeRoad', 'city14', 860, 155],
-  ['lakeRoad', 'city15', 877, 285], ['lakeRoad', 'city16', 895, 415],
-  ['lakeRoad', 'city17', 918, 545], ['roundabout', 'trail', 840, -420],
+  ['lakeRoad', 'roundabout', 820, -400], ['roundabout', 'trail', 840, -420],
   ['roundabout', 'westLake', 810, -402], ['national', 'country', -722, 52],
   ['national', 'city0', 810, 350], ['national', 'city7', 810, 350],
   ['mountainRoad', 'summitRing', 369, -1390], ['swLink', 'country', -620, -560],

@@ -1,6 +1,5 @@
 // realism.js — 环境材质真实化（v2.15 建立，v2.29 扩展道具微表面）
-// 设计原则：不改动 scenery.js / world.js 的生成代码（避免与并行会话撞车），
-// 在世界构建完成后对场景做一次"材质升级遍历"：
+// 在世界构建完成后对场景做一次材质升级遍历；分区顶点色由地形构建器负责：
 //   1. 地面：草地贴图换 V2（有机软斑，去平铺马赛克方块感）+ 草丛法线 + 压环境反射
 //   2. 远山：重塑装饰山脊的轮廓和岩草色过渡，不改可驾地形。
 //   3. v2.29 道具微表面：全场景"纯色无贴图"材质注入细节法线+粗糙度图（materials.js）
@@ -31,7 +30,7 @@ export function upgradeRealism(scene) {
     const geo = o.geometry;
     if (!geo || !geo.parameters) return;
 
-    // 地面：换贴图 + 法线 + 压环境反射 + 顶点色宏观色区
+    // 地面：共享草地贴图和法线，保持山脚接缝的纹理尺度一致
     if (!groundDone && o.isMesh && geo.type === 'PlaneGeometry' && geo.parameters.width === 5200) {
       const m = o.material;
       if (m) {
@@ -40,29 +39,16 @@ export function upgradeRealism(scene) {
         m.normalMap = makeGrassNormal(800);
         m.normalScale = new THREE.Vector2(0.8, 0.8);
         m.envMapIntensity = 0.45; // 草地别反射天空发亮，哑光更自然
-        // v2.22 宏观色区：两张 30m 平铺贴图糊满 5200m 的"贴图感"靠大尺度色彩破除——
-        // 世界坐标双频正弦算干湿色区，乘在贴图上（沃绿 ↔ 干草黄 ±12%），零额外采样成本
-        const pos = geo.attributes.position;
-        const cols = new Float32Array(pos.count * 3);
-        const v = new THREE.Vector3();
-        for (let i = 0; i < pos.count; i++) {
-          v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
-          const x = v.x, z = v.z;
-          const n = Math.sin(x * 0.008 + 1.3) * Math.sin(z * 0.006 + 4.1)
-            + 0.5 * Math.sin(x * 0.021 + z * 0.017)
-            + 0.35 * Math.sin(x * 0.043 - z * 0.031 + 2.2); // [-1.85, 1.85]
-          const t = THREE.MathUtils.clamp(n / 1.85 * 0.5 + 0.5, 0, 1);
-          // v2.29 裸土斑：大尺度低频噪声（斑块 200~800m）选出枯草/裸土区，
-          // 顶点色往土色方向乘（43m 顶点粒度足以承载该尺度，零贴图零采样成本）
-          const n2 = Math.sin(x * 0.0071 + 2.7) * Math.sin(z * 0.0053 + 1.1)
-            + 0.6 * Math.sin(x * 0.0028 - z * 0.0034 + 5.2)
-            + 0.4 * Math.sin(x * 0.012 + z * 0.016 + 0.7);
-          const w = THREE.MathUtils.smoothstep(n2, 0.55, 1.35);
-          cols[i * 3] = (0.88 + 0.24 * t) * (1 + 0.30 * w);      // 裸土偏红（R 升）
-          cols[i * 3 + 1] = (0.94 + 0.06 * t) * (1 - 0.36 * w);  // 裸土 G 降
-          cols[i * 3 + 2] = (0.92 - 0.18 * t) * (1 - 0.55 * w);  // 裸土 B 大降
+        // Terrain tint is baked by the world builders, not by this texture pass.
+        const mountain = scene.getObjectByName('drivable-mountain');
+        if (mountain) {
+          mountain.material.map.dispose();
+          mountain.material.map = m.map;
+          mountain.material.normalMap = m.normalMap;
+          mountain.material.normalScale.copy(m.normalScale);
+          mountain.material.envMapIntensity = m.envMapIntensity;
+          mountain.material.needsUpdate = true;
         }
-        geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
         m.vertexColors = true;
         m.needsUpdate = true;
         groundDone = true;

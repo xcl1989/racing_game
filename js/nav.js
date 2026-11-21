@@ -9,7 +9,9 @@ export function buildNavGraph(world, track) {
     return chains.get(id);
   }
   for (const r of world.roads) {
-    add(r.id, r.samples, r.kind === 'dirt' ? 1.3 : 1, r.id === 'roundabout' || r.id === 'summitRing');
+    const localStreet = r.id.startsWith('city') && r.samples[0].w < 10;
+    add(r.id, r.samples, r.kind === 'dirt' ? 1.45 : localStreet ? 1.22 : 1,
+      r.id === 'roundabout' || r.id === 'summitRing');
   }
   add('circuit', track.samples);
   const S = track.strip;
@@ -19,7 +21,7 @@ export function buildNavGraph(world, track) {
 
   // Project onto each centerline and split the chain at the actual junction.
   const movements = [];
-  const junctions = [...ROAD_JUNCTIONS];
+  const junctions = [...ROAD_JUNCTIONS, ...world.approachJunctions];
   const open = (id, x, z) => {
     const c = chains.get(id), list = c.pts;
     let best = Infinity, result;

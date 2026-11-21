@@ -8,6 +8,7 @@
 // 过渡用 smoothstep 缓动，重绘/重烘按 0.5s 节流（只在过渡期间发生）
 import * as THREE from 'three';
 import { SUN_U, SUN_V } from './environment.js';
+import { setWaterSun } from './water.js';
 
 const lerp = (a, b, t) => a + (b - a) * t;
 const smooth = (t) => t * t * (3 - 2 * t);
@@ -163,6 +164,7 @@ export function createWeather({
       // ---- 灯光 / 雾 / 曝光 / 云 / 太阳 sprite ----
       sun.intensity = p.sunI;
       sun.color.copy(p.sunColor);
+      setWaterSun(p.sunColor, p.sunGlow / .7);
       hemi.intensity = p.hemiI;
       hemi.color.copy(p.hemiSky);
       hemi.groundColor.copy(p.hemiGnd);

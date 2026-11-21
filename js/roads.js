@@ -7,14 +7,14 @@ const profiles = {
   concrete: { darken: 0.24, wetRough: 0.68, env: 0.36, wetEnv: 0.44, variation: 0.16, edges: 0 },
   marking: { darken: 0.09, wetRough: 0.54, env: 0.48, wetEnv: 0.56, variation: 0.03, edges: 0 },
 };
-const roadWetness = { value: 0 };
+export const visualWetness = { value: 0 };
 let detailTexture;
 
 export function setRoadWet(wet) {
-  roadWetness.value = THREE.MathUtils.clamp(wet, 0, 1);
+  visualWetness.value = THREE.MathUtils.clamp(wet, 0, 1);
 }
 
-function roadDetail() {
+export function roadDetailTexture() {
   if (detailTexture) return detailTexture;
   const size = 128, data = new Uint8Array(size * size * 4);
   // Seamless, seeded value noise; does not consume the world's random stream.
@@ -55,8 +55,8 @@ export function createRoadMaterial(kind, options) {
   material.customProgramCacheKey = () => `road-surface-v3:${kind}`;
   const f = (n) => n.toFixed(3);
   material.onBeforeCompile = (shader) => {
-    shader.uniforms.roadWetness = roadWetness;
-    shader.uniforms.roadDetail = { value: roadDetail() };
+    shader.uniforms.roadWetness = visualWetness;
+    shader.uniforms.roadDetail = { value: roadDetailTexture() };
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec2 vRoadWorld;')
       .replace('#include <project_vertex>', `#include <project_vertex>

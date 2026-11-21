@@ -1,11 +1,13 @@
 // world.js — 开放大世界：高速公路 / 城市街区 / 乡道桥梁 / 河流 / 红绿灯 / NPC 路线 / 国道 / 盘山公路
 import * as THREE from 'three';
 import { createRoadMaterial } from './roads.js';
-import { buildRoadIndex, roadOverlapsBox } from './road-network.js';
+import { buildRoadIndex } from './road-network.js';
 import { buildNorthInterchange } from './north-interchange.js';
+import { addApproachMarkings, localPatrol, publicApproaches } from './road-transition.js';
 import { addShowcaseCorridor } from './route-detail.js';
 import { addNorthStorefronts } from './p10-storefronts.js';
 import { boxBatch } from './scene-detail.js';
+import { addSurfaceFinish, facadeFinish, terrainTint } from './world-surface-finish.js';
 import { LAKE, FOOTHILL_LAKE, RIVER, worldGuide, addWorldSigns } from './world-guide.js';
 import {
   makeAsphaltTextures, makeLaneTextures, makeHighwayTextures, makeJunctionTextures,
@@ -15,7 +17,7 @@ import {
 import { makeWaterMaterial, updateWater } from './water.js'; // v2.24 水面材质升级
 
 // 通用道路带状网格构建：pts 含 y（桥面/山路抬升用）
-// tex: 0=街道沥青 1=窄巷（无双黄线）2=高速四车道 3=土路（野径）
+// tex: 0=街道沥青 1=窄巷（无双黄线）2=高速四车道 3=土路（野径）4=无预绘标线的铺装
 // matOpts.follow = 侧点贴地形偏移量（v2.14.3）：坡地路段路面左右两边各自采样地形高度，
 // 避免"横向平直路面在坡上一侧悬空"（野径/湖西环路过湖盆坡带时的悬空路）
 let terrainSampler = null; // buildWorld 烘焙地形后注入（ribbon 在模块顶层，作用域隔离）
@@ -24,14 +26,14 @@ let terrainSampler = null; // buildWorld 烘焙地形后注入（ribbon 在模�
 const kerbJobs = [];      // {id, cv, quadCenters, group}
 const ribbonRegistry = []; // {id, samples, width, tex}
 function ribbon(pts, closed, width, matOpts = {}, tex = 0) {
-  const id = ribbonRegistry.length;
-  const curve = new THREE.CatmullRomCurve3(pts, closed, matOpts.curveType ?? 'catmullrom', 0.5);
+  const curve = pts instanceof THREE.CurvePath ? pts : new THREE.CatmullRomCurve3(pts, closed, matOpts.curveType ?? 'catmullrom', 0.5);
   // v2.28b: segLen 可调采样密度（默认 8m）。山地 follow 路必须细于地形网格（21m）——
   // 粗弦线在凸形路段会被地形三角刺穿（凸包差 >0.1m 抬升），细到 3m 弦线即面内精确细化
   const SEG = Math.max(64, Math.floor(curve.getLength() / (matOpts.segLen ?? 8)));
   const asphalt = tex === 1 ? makeLaneTextures()
     : tex === 2 ? makeHighwayTextures()
     : tex === 3 ? makeDirtTextures()
+    : tex === 4 ? makeJunctionTextures()
     : makeAsphaltTextures();
   const verts = [], uvs = [], idx = [];
   const edgeL = [], edgeR = []; // v2.23: 左右路缘高度（缘石随横向坡度贴合）
@@ -209,7 +211,6 @@ export function buildWorld(scene) {
   kerbJobs.length = 0;    // v2.33 缘石后处理作业重置（可重复构建）
   ribbonRegistry.length = 0;
   const beaconBlinks = [];                    // 地标塔顶警示灯
-  let eastConnPts, eastConnRoad, southConnPts, southConnRoad;
 
   // ---- 高速公路：外环大 Oval（中心 600,150，长轴 1250 / 短轴 950）----
   // ⚠️ 抬高 2cm：与草地大圆盘(y=0)共面会全程 Z-fighting 闪烁
@@ -289,10 +290,6 @@ export function buildWorld(scene) {
   trafficCurve.getTangentAt = (t) => trafficCurve.getTangent(t);
   const cityRoute = { curve: trafficCurve, closed: true, length: trafficCurve.getLength() };
 
-  // ---- 高速连接大道：城市 ↔ 高速的匝道风格直线接入 ----
-  // 动态采样高速样条找最近点；端点伸过高速中线 4m 保证无缝衔接且不戳出对侧
-  // ⚠️ 高度 0.04：高于高速(0.02)/横街(0.026)，重叠区高差足够防远距 Z-fighting
-  const Y_CONN = 0.04;
   function nearestCurvePoint(curve, tx, tz, filter) {
     let bp = null, bd = Infinity;
     for (let i = 0; i <= 400; i++) {
@@ -303,54 +300,30 @@ export function buildWorld(scene) {
     }
     return bp;
   }
-  {
-    const hp = nearestCurvePoint(highway.curve, 1500, 350, (p) => p.x > 1400);
-    const eastPts = [
-      new THREE.Vector3(xs[4] + 6, Y_CONN, 350),
-      new THREE.Vector3(1420, Y_CONN, 352),
-      new THREE.Vector3(1560, Y_CONN, 350 + (hp.z - 350) * 0.45),
-      new THREE.Vector3(hp.x - 22, Y_CONN, hp.z),
-      new THREE.Vector3(hp.x - 4, Y_CONN, hp.z),
-    ];
-    const eastConn = ribbon(eastPts, false, 14, { roughness: 0.9, curveType: 'centripetal' });
-    group.add(eastConn.mesh);
-    eastConnPts = eastPts; eastConnRoad = eastConn;
-  }
-  {
-    const hp = nearestCurvePoint(highway.curve, 800, 1000, (p) => p.z > 700);
-    // v2.33 径向 T 形汇入：旧版最后两点沿高速方向平行搭接 18m（1.6m 近重叠，
-    // 导流带断裂缘石翘起——audit_07）。改为沿汇入方向垂直切进高速边缘。
-    const prev = new THREE.Vector3(850, Y_CONN, 950);
-    const dir = new THREE.Vector3().subVectors(hp, prev).setY(0).normalize();
-    const southPts = [
-      new THREE.Vector3(1050, Y_CONN, zs[4] + 6),
-      new THREE.Vector3(1000, Y_CONN, 700),
-      new THREE.Vector3(920, Y_CONN, 830),
-      prev,
-      prev.clone().addScaledVector(dir, prev.distanceTo(hp) - 14), // 距高速中心 14m 处（高速半宽 10 + 过渡）
-      hp.clone(),
-    ];
-    const southConn = ribbon(southPts, false, 14, { roughness: 0.9 });
-    group.add(southConn.mesh);
-    southConnPts = southPts; southConnRoad = southConn;
-  }
-
+  const approaches = publicApproaches(highway, { eastX: xs.at(-1), westX: xs[0], outerZ: zs.at(-1), lakeZ: zs[0] });
+  const makeApproach = (curve, width, roughness) => ribbon(curve, false, width, { roughness, segLen: 3.0, curb: false }, 4);
+  const eastConnRoad = makeApproach(approaches.east.curve, approaches.east.width, .9);
+  const southConnRoad = makeApproach(approaches.belt.curve, approaches.belt.width, .9);
+  const lakeRoad = makeApproach(approaches.lake, 9, .96);
+  group.add(eastConnRoad.mesh, southConnRoad.mesh, lakeRoad.mesh);
+  addApproachMarkings(group, [
+    { route: eastConnRoad, endGap: 10.8, stop: true },
+    { route: southConnRoad, endGap: 10.8, stop: true },
+    { route: lakeRoad, endGap: 8.5, stop: false },
+  ]);
+  const approachJunctions = [
+    ...[['eastConn', approaches.east], ['southConn', approaches.belt]].map(([id, link]) =>
+      ['highway', id, link.junction.x, link.junction.z]),
+    ['lakeRoad', 'city0', xs[0], zs[0] - 5.7], ['lakeRoad', 'city5', xs[0], zs[0]],
+  ];
+  const approachTraffic = {
+    east: localPatrol('eastConn', eastConnRoad, 22, 35),
+    belt: localPatrol('southConn', southConnRoad, 22, 39),
+    lake: localPatrol('lakeRoad', lakeRoad, 24, 26),
+  };
   const northInterchange = buildNorthInterchange(highway, zs[4]);
   group.add(northInterchange.group);
 
-  // ---- 湖滨路：城市南出口 → 湖畔环岛（把玩家引向湖景的休闲小路）----
-  // 湖心 (660,-560) r140（scenery 同步此坐标），环岛距水线 189m 不入水
-  const Y_LAKE = 0.02;
-  const lakeRoadPts = [
-    new THREE.Vector3(930, Y_LAKE, zs[4] + 2),  // 起点：压进横街边缘 4m 无缝衔接
-    new THREE.Vector3(890, Y_LAKE, 380),
-    new THREE.Vector3(850, Y_LAKE, 60),
-    new THREE.Vector3(830, Y_LAKE, -240),
-    new THREE.Vector3(822, Y_LAKE, -380),
-    new THREE.Vector3(820, Y_LAKE, -402),       // 端点扎进环岛圈带内
-  ];
-  const lakeRoad = ribbon(lakeRoadPts, false, 8, { color: 0x9a9184, roughness: 1 });
-  group.add(lakeRoad.mesh);
   // 环岛：闭合圆环（高于接入路 12mm 防共面闪烁）
   const roundPts = [];
   for (let i = 0; i < 12; i++) {
@@ -536,25 +509,17 @@ export function buildWorld(scene) {
   terrainSampler = groundSampler; // 烘焙完成后向模块级 ribbon 注入采样器（follow 贴地路贴可视面）
   {
     // 山体网格渲染：顶点直接吃 mGrid（与 sampleMountain/物理严格一致），反对角线三角化
-    const verts = [], cols = [], idx = [];
-    const cGrass = [1, 1, 1], cRock = [0.58, 0.56, 0.54], cSnow = [0.93, 0.95, 1.0];
+    const verts = [], cols = [], uvs = [], idx = [];
+    const tint = new THREE.Color();
     for (let j = 0; j <= M_SEG; j++) {
       for (let i = 0; i <= M_SEG; i++) {
         const x = MT.x - M_HALF + i * M_STEP, z = MT.z - M_HALF + j * M_STEP;
         const h = mGrid[j * (M_SEG + 1) + i];
         verts.push(x, h, z);
-        // 按海拔配色：低=草地纹理原色 → 岩灰 → 雪白
-        let c;
-        if (h < 14) c = cGrass;
-        else if (h < 34) { // 14-34 绿→岩渐变
-          const t = (h - 14) / 20;
-          c = cGrass.map((v, k) => v * (1 - t) + cRock[k] * t);
-        } else if (h < 52) c = cRock;
-        else { // 52-70 岩→雪渐变
-          const t = Math.min(1, (h - 52) / 16);
-          c = cRock.map((v, k) => v * (1 - t) + cSnow[k] * t);
-        }
-        cols.push(...c);
+        const slope = Math.hypot(samplePlane(x+22,z)-samplePlane(x-22,z), samplePlane(x,z+22)-samplePlane(x,z-22)) / 44;
+        terrainTint(x,z,h,slope,tint).toArray(cols,cols.length);
+        // Match the plain's world scale without changing the mountain height grid.
+        uvs.push((x + G_HALF) / G_SIZE, 1 - (z + G_HALF) / G_SIZE);
       }
     }
     const W = M_SEG + 1;
@@ -567,11 +532,13 @@ export function buildWorld(scene) {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
     g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
     g.setIndex(idx);
     g.computeVertexNormals();
-    const mtMesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
-      map: makeGrassTexture(24), vertexColors: true, roughness: 1, metalness: 0,
-    }));
+    const mtMesh = new THREE.Mesh(g, addSurfaceFinish(new THREE.MeshStandardMaterial({
+      map: makeGrassTexture(170), vertexColors: true, roughness: 1, metalness: 0,
+    }), 'terrain'));
+    mtMesh.name = 'drivable-mountain';
     mtMesh.receiveShadow = true;
     group.add(mtMesh);
   }
@@ -682,7 +649,7 @@ export function buildWorld(scene) {
 
   // ---- 桥（跨下切河道：桥面 y=1.2 高出水面 2.7m；梁 + 4 桥墩入水）----
   // ⚠️ 旧版栏杆沿 Z 摆放与过河方向垂直（等于横在路中间的栅栏），已纠正
-  const bridgeConcrete = createRoadMaterial('concrete', {color:0x8c887f,roughness:.9});
+  const bridgeConcrete = addSurfaceFinish(createRoadMaterial('concrete', {color:0x8c887f,roughness:.9}), 'stone');
   const bridgeSteel = new THREE.MeshStandardMaterial({color:0x505b59,roughness:.64,metalness:.5});
   const supports = [], steelwork = [];
   for (const x of [-936,-912,-888,-864]) {
@@ -715,7 +682,7 @@ export function buildWorld(scene) {
   const river = new THREE.Mesh(
     new THREE.PlaneGeometry(76, RIVER.halfLength * 2, 8, 420),
     makeWaterMaterial({
-      deep: 0x114f78, shallow: 0x2a7a8a, glint: 1.0,
+      deep: 0x304f57, shallow: 0x648071, foam: .32, glint: .63,
       shoreMode: 'band', center: [RIVER_X, 0], shoreR: RIVER.halfWidth,
       band: 9, foamBand: 2.5, waveAmp: 0.042,
       normalTex: riverNormal, normalScale: 0.55, repeat: 9,
@@ -732,7 +699,7 @@ export function buildWorld(scene) {
   const lake2 = new THREE.Mesh(
     new THREE.PlaneGeometry(430, 430, 64, 64),
     makeWaterMaterial({
-      deep: 0x0d4f85, shallow: 0x1d8597, glint: 0.9,
+      deep: 0x154052, shallow: 0x407480, foam: .22, glint: .75,
       shoreMode: 'circle', center: [FOOTHILL_LAKE.x, FOOTHILL_LAKE.z], shoreR: FOOTHILL_LAKE.r,
       band: 28, foamBand: 3.5, waveAmp: 0.07,
       normalTex: lake2Normal, normalScale: 0.4, repeat: 27,
@@ -747,7 +714,6 @@ export function buildWorld(scene) {
   // ⚠️ 声明在块外：块内收集，buildWorld 末尾 return 导出
   const bldColliders = [], storefrontAnchors = [], signalHeads = [];
   let streetGlazing, citySidewalks;
-  const lakeClearance = (x, z, hw, hd) => !roadOverlapsBox(lakeRoad.samples, x, z, hw, hd, 1.5);
   // 巷道从街区正中穿过 → 楼房退到四象限（更小更密，城市感更强）
   // 公园街区：四象限草坪（矩形避开巷道与主街）+ 一个水池
   const PARK_BLOCKS = new Set(['1_2', '2_0']);
@@ -769,7 +735,7 @@ export function buildWorld(scene) {
       const ry = Math.max(2, Math.round(hRef / 12.8)); // tile = 4 层 ×3.2m
       map.repeat.set(2, ry); ems.repeat.set(2, ry);
       const mat = new THREE.MeshStandardMaterial({
-        color: 0xffffff, map, emissiveMap: ems,
+        color: 0xffffff, map, emissiveMap: ems, roughnessMap: facadeFinish(map, false),
         emissive: 0xffdd88, emissiveIntensity: 0.12,
         roughness: 0.85, metalness: 0.06, envMapIntensity: 0.55,
       });
@@ -788,7 +754,7 @@ export function buildWorld(scene) {
       const map = glassBase.clone(); map.needsUpdate = true;
       map.repeat.set(2, Math.max(3, Math.round(hRef / 10))); // tile ≈ 3 层楼
       const mat = new THREE.MeshStandardMaterial({
-        color: 0xc4ced0, map, metalness: 0.24, roughness: 0.36, envMapIntensity: 0.95,
+        color: 0xc1c9c5, map, roughnessMap: facadeFinish(map, true), metalness: .17, roughness: .56, envMapIntensity: .87,
       });
       const mesh = new THREE.InstancedMesh(bldGeo, mat, N_GLASS);
       mesh.castShadow = true;
@@ -877,7 +843,6 @@ export function buildWorld(scene) {
             bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
             bz + qz * 28 + (Math.random() - 0.5) * 5
           );
-          if (!lakeClearance(dummy.position.x, dummy.position.z, w / 2, dpt / 2)) continue;
           dummy.scale.set(w, h, dpt);
           dummy.rotation.y = 0;
           dummy.updateMatrix();
@@ -926,7 +891,6 @@ export function buildWorld(scene) {
             bx + qx * 26 + (Math.random() - 0.5) * 5, h / 2,
             bz + qz * 28 + (Math.random() - 0.5) * 5
           );
-          if (!lakeClearance(dummy.position.x, dummy.position.z, w / 2, dpt / 2)) continue;
           dummy.scale.set(w, h, dpt);
           dummy.updateMatrix();
           // v2.33 玻璃塔同样记录脚印碰撞体
@@ -958,7 +922,7 @@ export function buildWorld(scene) {
     for (const m of glassBuckets) { m.count = m.userData.cnt; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
     rooftops.count = roofN;
     group.add(...bldBuckets, ...glassBuckets, rooftops);
-    boxBatch(group,'building-plinths',new THREE.MeshStandardMaterial({color:0x797368,roughness:.92}),masonry);
+    boxBatch(group,'building-plinths',addSurfaceFinish(new THREE.MeshStandardMaterial({color:0x797368,roughness:.92}),'stone'),masonry);
     boxBatch(group,'building-metalwork',new THREE.MeshStandardMaterial({color:0x545a58,roughness:.63,metalness:.35}),frames);
     streetGlazing = boxBatch(group,'building-street-glazing',new THREE.MeshStandardMaterial({color:0x34484e,roughness:.33,metalness:.16,envMapIntensity:.8}),glazing);
   }
@@ -978,17 +942,7 @@ export function buildWorld(scene) {
         const b=(alongZ?cuts[i].az:cuts[i].ax)-cuts[i].width/2-2;
         for (const side of [-1,1]) {
           const offset=(alongZ?street.ax:street.az)+side*(street.width/2+1.04);
-          // Leave the diagonal lakeside junctions open without removing the whole walk.
-          for (let from = a; from < b;) {
-            let to = Math.min(b, from + 3);
-            const fits = (lo, hi) => alongZ
-              ? lakeClearance(offset, (lo + hi) / 2, .9, (hi - lo) / 2)
-              : lakeClearance((lo + hi) / 2, offset, (hi - lo) / 2, .9);
-            if (!fits(from, to)) { from = to; continue; }
-            while (to < b && fits(to, Math.min(b, to + 3))) to = Math.min(b, to + 3);
-            walks.push(alongZ ? [offset,.066,(from+to)/2,1.8,.11,to-from] : [(from+to)/2,.066,offset,to-from,.11,1.8]);
-            from = to;
-          }
+          walks.push(alongZ ? [offset,.066,(a+b)/2,1.8,.11,b-a] : [(a+b)/2,.066,offset,b-a,.11,1.8]);
         }
       }
     }
@@ -1151,16 +1105,16 @@ export function buildWorld(scene) {
   const lines = (...routes) => routes.map(route => route.samples.map(({ pos }) => [pos.x, pos.z]));
   const mapRoads = {
     highway: lines(highway),
-    arterial: lines(national, eastConnRoad, southConnRoad, swLinkRoad),
+    arterial: lines(national, eastConnRoad, southConnRoad, swLinkRoad, lakeRoad),
     ramps: northInterchange.minimap,
     local: [...cityStreets.map(s => [[s.ax, s.az], [s.bx, s.bz]]),
-      ...lines(lakeRoad, westLakeRoad, roundabout, mountainRoad, summitRing)],
+      ...lines(westLakeRoad, roundabout, mountainRoad, summitRing)],
     dirt: lines(country, trail),
     bridge: [lines(country)[0].filter(([x, z]) => Math.abs(x - RIVER.x) <= 40 && Math.abs(z - 61) < 10),
       southCrossing.map(({ pos }) => [pos.x, pos.z])],
   };
-  const guide = worldGuide({ MT, northInterchange, national, country, lakeRoad, westLakeRoad, mountainRoad });
-  addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 &&
+  const guide = worldGuide({ MT, northInterchange, national, country, lakeRoad, westLakeRoad, mountainRoad, eastConnRoad, southConnRoad });
+  addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 && !onAnyRoad({ x, z }) &&
     !bldColliders.some(b => Math.abs(x - b.x) < b.hw + .8 && Math.abs(z - b.z) < b.hd + .8));
 
   const corridor = addShowcaseCorridor(group, { highway, country, bldColliders, groundSampler, onAnyRoad });
@@ -1180,7 +1134,7 @@ export function buildWorld(scene) {
   return {
     group, highway, cityRoute, country, cityStreets,
     eastConn: eastConnRoad, southConn: southConnRoad, northInterchange,
-    westLake: westLakeRoad, swLink: swLinkRoad,
+    westLake: westLakeRoad, swLink: swLinkRoad, approachJunctions, approachTraffic,
     lakeRoad, roundabout, national, mountainRoad, summitRing, trail,
     sprintRoutes, bldColliders,
     terrainH, sampleTerrain, groundSampler, MT,
