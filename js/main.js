@@ -887,6 +887,8 @@ function animate() {
     else renderer.render(scene, camera);
   }
 }
+// The sample needs the actual street props, and builds once before the first frame.
+world.addStorefronts(scenery.storefrontObstacles);
 animate();
 
 // 调试/测试钩子：URL 带 #autotest 时自动走 开始自驾→选默认车→进自由漫游

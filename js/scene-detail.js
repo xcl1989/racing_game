@@ -15,6 +15,7 @@ export function boxBatch(parent, name, material, items, castShadow = false) {
   mesh.castShadow = castShadow;
   mesh.receiveShadow = true;
   parent.add(mesh);
+  return mesh;
 }
 
 export function firCrown() {

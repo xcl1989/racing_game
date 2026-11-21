@@ -4,6 +4,7 @@ import { createRoadMaterial } from './roads.js';
 import { buildRoadIndex, roadOverlapsBox } from './road-network.js';
 import { buildNorthInterchange } from './north-interchange.js';
 import { addShowcaseCorridor } from './route-detail.js';
+import { addNorthStorefronts } from './p10-storefronts.js';
 import { boxBatch } from './scene-detail.js';
 import { LAKE, FOOTHILL_LAKE, RIVER, worldGuide, addWorldSigns } from './world-guide.js';
 import {
@@ -744,7 +745,8 @@ export function buildWorld(scene) {
   // ---- 城市楼房 + 街区公园 ----
   // v2.33 建筑碰撞体：轴对齐脚印 {x, z, hw, hd}（楼块 rotation.y=0，玩家车圆-AABB 推出用）
   // ⚠️ 声明在块外：块内收集，buildWorld 末尾 return 导出
-  const bldColliders = [];
+  const bldColliders = [], storefrontAnchors = [], signalHeads = [];
+  let streetGlazing, citySidewalks;
   const lakeClearance = (x, z, hw, hd) => !roadOverlapsBox(lakeRoad.samples, x, z, hw, hd, 1.5);
   // 巷道从街区正中穿过 → 楼房退到四象限（更小更密，城市感更强）
   // 公园街区：四象限草坪（矩形避开巷道与主街）+ 一个水池
@@ -801,7 +803,9 @@ export function buildWorld(scene) {
     const dummy = new THREE.Object3D();
     const tint = new THREE.Color();
     const masonry = [], frames = [], glazing = [];
-    function buildingDetails(x,z,w,h,d,glass) {
+    function buildingDetails(owner, baseY, h, glass) {
+      const { x, z, hw, hd } = owner, w = hw * 2, d = hd * 2;
+      const towardStreet = Math.sign(1170 - x);
       masonry.push([x,1.65,z,w+.025,3.3,d+.025], [x,h+.22,z,w+.026,.44,d+.026]);
       for (const side of [-1,1]) {
         for (const end of [-1,1]) {
@@ -810,10 +814,16 @@ export function buildWorld(scene) {
         for (const level of [3.35, h*.56]) {
           frames.push([x,level,z+side*(d/2-.08),w,.42,.2], [x+side*(w/2-.08),level,z,.2,.42,d]);
         }
+        const oldGlazing = [];
         for (let i=-2;i<=2;i++) {
+          oldGlazing.push(glazing.length);
           const zw=z+i*d/6, xw=x+i*w/6;
           // The opaque plinth is recessed from these glass panels by 2 cm.
           glazing.push([x+side*(w/2+.022),1.75,zw,.045,2.35,d*.145], [xw,1.75,z+side*(d/2+.022),w*.145,2.35,.045]);
+        }
+        if (side === towardStreet && Math.abs(1170 - x) <= 40 && z + hd >= 490 && z - hd <= 600) {
+          storefrontAnchors.push({ owner, side, wall: x + side * hw, lo: z - hd, hi: z + hd,
+            baseY, oldGlazing });
         }
       }
       if (glass) frames.push([x,h+1.3,z,w*.47,2.1,d*.51]);
@@ -876,7 +886,7 @@ export function buildWorld(scene) {
             x: dummy.position.x, z: dummy.position.z,
             hw: w / 2, hd: dpt / 2,
           });
-          buildingDetails(dummy.position.x, dummy.position.z, w, h, dpt, false);
+          buildingDetails(bldColliders.at(-1), dummy.position.y - h / 2, h, false);
           const bucket = bldBuckets[h < 46 ? 0 : h < 74 ? 1 : 2];
           const bi = bucket.userData.cnt;
           if (bi < N_BLD) {
@@ -924,7 +934,7 @@ export function buildWorld(scene) {
             x: dummy.position.x, z: dummy.position.z,
             hw: w / 2, hd: dpt / 2,
           });
-          buildingDetails(dummy.position.x, dummy.position.z, w, h, dpt, true);
+          buildingDetails(bldColliders.at(-1), dummy.position.y - h / 2, h, true);
           const gbucket = glassBuckets[h < 80 ? 0 : 1];
           const gi = gbucket.userData.cnt;
           if (gi < N_GLASS) {
@@ -950,7 +960,7 @@ export function buildWorld(scene) {
     group.add(...bldBuckets, ...glassBuckets, rooftops);
     boxBatch(group,'building-plinths',new THREE.MeshStandardMaterial({color:0x797368,roughness:.92}),masonry);
     boxBatch(group,'building-metalwork',new THREE.MeshStandardMaterial({color:0x545a58,roughness:.63,metalness:.35}),frames);
-    boxBatch(group,'building-street-glazing',new THREE.MeshStandardMaterial({color:0x34484e,roughness:.33,metalness:.16,envMapIntensity:.8}),glazing);
+    streetGlazing = boxBatch(group,'building-street-glazing',new THREE.MeshStandardMaterial({color:0x34484e,roughness:.33,metalness:.16,envMapIntensity:.8}),glazing);
   }
 
   // Paint stops at the junction, not across the crossing traffic lanes.
@@ -986,7 +996,7 @@ export function buildWorld(scene) {
       zebra.push([x+k*.86,.052,z+side*4.88,.43,.005,1.38], [x+side*4.88,.052,z+k*.86,1.38,.005,.43]);
     }
     boxBatch(group,'city-junctions',createRoadMaterial('asphalt',{map,roughnessMap:roughness}),patches);
-    boxBatch(group,'city-sidewalks',createRoadMaterial('concrete',{color:0x938e83}),walks);
+    citySidewalks = boxBatch(group,'city-sidewalks',createRoadMaterial('concrete',{color:0x938e83}),walks);
     boxBatch(group,'city-crosswalks',createRoadMaterial('marking',{color:0xdfd8c8}),zebra);
   }
 
@@ -1015,6 +1025,7 @@ export function buildWorld(scene) {
         return material;
       });
       group.add(head);
+      signalHeads.push(head);
     }
     lights.push({ pos: new THREE.Vector3(lx, 0, lz), heads, offset: i * 5 });
   }
@@ -1152,7 +1163,13 @@ export function buildWorld(scene) {
   addWorldSigns(group, guide, groundSampler, (x, z) => distToRoads(x, z) > 7 &&
     !bldColliders.some(b => Math.abs(x - b.x) < b.hw + .8 && Math.abs(z - b.z) < b.hd + .8));
 
-  addShowcaseCorridor(group, { highway, country, bldColliders, groundSampler, onAnyRoad });
+  const corridor = addShowcaseCorridor(group, { highway, country, bldColliders, groundSampler, onAnyRoad });
+  const wayfinding = group.getObjectByName('world-wayfinding');
+  const addStorefronts = (props) => addNorthStorefronts(group, {
+    storefrontAnchors, streetGlazing, cityStreets, roads, surfaceAt, bldColliders, corridor,
+    interchangePavement: northInterchange.group.children.filter(mesh => mesh.renderOrder === 1),
+    obstacles: [citySidewalks, wayfinding, ...signalHeads, ...props],
+  });
 
   // v2.33 缘石统一挂接：所有路建完后执行（交叉路口条带剔除）
   // Highway kerb jobs store the +side first and the inner (-side) second.
@@ -1170,6 +1187,6 @@ export function buildWorld(scene) {
     lights, update, signalAt,
     heightAt, isOnCityRoad, distToCityRoads,
     onAnyRoad, surfaceAt, distToRoads,
-    roads, mapRoads, guide,
+    roads, mapRoads, guide, addStorefronts,
   };
 }

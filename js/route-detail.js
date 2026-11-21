@@ -8,7 +8,7 @@ export function addShowcaseCorridor(parent, world) {
   group.name = 'showcase-corridor';
   parent.add(group);
   const facade = [], awnings = [], glass = [], rails = [], posts = [], reflectors = [];
-  const forage = [];
+  const forage = [], storefrontBays = [];
   const mat = (color, roughness = .86) => new THREE.MeshStandardMaterial({ color, roughness });
   const roadPoint = (s, offset) => s.pos.clone().addScaledVector(s.side, offset);
   const bankY = p => groundSampler(p.x, p.z);
@@ -19,13 +19,18 @@ export function addShowcaseCorridor(parent, world) {
     return !bldColliders.some(b => Math.abs(x - b.x) < b.hw + radius && Math.abs(z - b.z) < b.hd + radius);
   };
 
-  for (const { x, z, hw, hd } of bldColliders) {
+  for (const owner of bldColliders) {
+    const { x, z, hw, hd } = owner;
     const axis = Math.sign(1170 - x);
     if (z < 405 || z > 615 || Math.abs(x - 1170) > 55 || !axis || hd < 6) continue;
     const wall = x + axis * hw;
     for (const offset of [-.51, .51]) {
       const bay = z + hd * offset;
       if (![bay - 2.5, bay, bay + 2.5].every(p => !onAnyRoad({ x: wall + axis * 2, z: p }))) continue;
+      // Track P5 shop rows by owner and source; the reflector batch also holds road hardware.
+      storefrontBays.push({ owner, lo: bay - 2.55, hi: bay + 2.55,
+        reveals: [facade.length, facade.length + 1], glass: [glass.length, glass.length + 1],
+        canopy: [awnings.length], warmEdge: [reflectors.length] });
       // Recessed dark surround, divided glass and a warm canopy edge.
       facade.push([wall + axis * .11, 1.53, bay, .22, 2.96, 4.9],
         [wall + axis * .27, 1.49, bay, .11, 2.72, .12]);
@@ -98,11 +103,13 @@ export function addShowcaseCorridor(parent, world) {
     forage.push([p.x, bankY(p) + .12, p.z, 1.34, .31, .82, .9 * i]);
   }
 
-  boxBatch(group, 'corridor-shop-reveals', mat(0x413a32), facade);
-  boxBatch(group, 'corridor-shop-glazing', mat(0x476575, .39), glass);
-  boxBatch(group, 'corridor-shop-canopies', mat(0x813f31, .71), awnings);
+  const revealsMesh = boxBatch(group, 'corridor-shop-reveals', mat(0x413a32), facade);
+  const glassMesh = boxBatch(group, 'corridor-shop-glazing', mat(0x476575, .39), glass);
+  const canopyMesh = boxBatch(group, 'corridor-shop-canopies', mat(0x813f31, .71), awnings);
   boxBatch(group, 'corridor-bridge-terminal-rails', mat(0x505b59, .64), rails);
   boxBatch(group, 'corridor-roadside-posts', mat(0x626a64), posts);
-  boxBatch(group, 'corridor-reflectors', new THREE.MeshStandardMaterial({ color: 0xd7bb84, emissive: 0x685021, emissiveIntensity: .23 }), reflectors);
+  const reflectorMesh = boxBatch(group, 'corridor-reflectors', new THREE.MeshStandardMaterial({ color: 0xd7bb84, emissive: 0x685021, emissiveIntensity: .23 }), reflectors);
   boxBatch(group, 'corridor-bank-stones', mat(0x777064), forage);
+  return { storefrontBays, batches: { reveals: revealsMesh, glass: glassMesh,
+    canopy: canopyMesh, warmEdge: reflectorMesh } };
 }

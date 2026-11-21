@@ -598,7 +598,7 @@ export function buildScenery(scene, track, world, rich = true) {
   // ============ 场景丰富化 Props（rich 模式专属，全部实例化）============
 
   // ---- 路灯：沿主环道两侧交错 + 城市街道成排 ----
-  const lampPoles = [], lampHeads = [];
+  const storefrontObstacles = [];
   {
     const poleGeo = new THREE.CylinderGeometry(0.09, 0.13, 5.2, 6);
     const headGeo = new THREE.SphereGeometry(0.22, 8, 8);
@@ -645,6 +645,7 @@ export function buildScenery(scene, track, world, rich = true) {
     lamps.count = heads.count = li;
     lamps.castShadow = true;
     scene.add(lamps, heads);
+    storefrontObstacles.push(lamps, heads);
   }
 
   // ---- 轮胎墙：急弯外侧缓冲（检测样条转角率放置）----
@@ -858,6 +859,7 @@ export function buildScenery(scene, track, world, rich = true) {
     stTrunk.count = si; stCanopy.count = sci;
     if (stCanopy.instanceColor) stCanopy.instanceColor.needsUpdate = true;
     scene.add(stTrunk, stCanopy);
+    storefrontObstacles.push(stTrunk, stCanopy);
   }
 
   // ---- 干草垛（v2.13）：田野横放草卷，乡村感（Forza 英国地景标志性物件）----
@@ -1067,5 +1069,5 @@ export function buildScenery(scene, track, world, rich = true) {
     }
   }
 
-  return { ground, railGroup, update };
+  return { ground, railGroup, update, storefrontObstacles };
 }

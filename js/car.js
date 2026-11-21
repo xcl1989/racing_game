@@ -180,7 +180,14 @@ const PARTS = {
   jeep392: { paint: /^jmi_1355060001_004$/, glass: /^glass$/, lens: /^(red_glass|orange_glass)$/, rim: /^jmi_rim_002$/, trim: /^jmi_plastic1$/ },
 };
 
-function tuneCarPart(source, role, paintColor) {
+const FERRARI_FINISH = {
+  paint: { metalness: 0.09, roughness: 0.42, clearcoat: 0.68,
+    clearcoatRoughness: 0.21, envMapIntensity: 1.02 },
+  glass: { roughness: 0.22, opacity: 0.81, envMapIntensity: 1.02 },
+  rubber: { roughness: 0.92, envMapIntensity: 0.36 },
+};
+
+function tuneCarPart(source, role, paintColor, modelId) {
   let mat;
   if ((role === 'paint' || role === 'glass') && !source.isMeshPhysicalMaterial) {
     mat = new THREE.MeshPhysicalMaterial();
@@ -209,6 +216,12 @@ function tuneCarPart(source, role, paintColor) {
     Object.assign(mat, { metalness: 0.74, roughness: 0.34, envMapIntensity: 1 });
   } else {
     Object.assign(mat, { metalness: 0, roughness: 0.72, envMapIntensity: 0.65 });
+  }
+  if (modelId === 'ferrari' && Object.hasOwn(FERRARI_FINISH, role)) {
+    const finish = FERRARI_FINISH[role];
+    Object.assign(mat, finish);
+    if (role === 'paint' && mat.roughnessMap) mat.roughness = 0.48;
+    if (role === 'glass') mat.color.setHex(0x27343c);
   }
   return mat;
 }
@@ -247,7 +260,7 @@ export function createCarFromTemplate(template, colorHex, wheelOpts = null) {
         if (!role) return source;
         const key = source.uuid + ':' + role;
         if (!partMaterials.has(key)) {
-          const mat = tuneCarPart(source, role, paintColor);
+          const mat = tuneCarPart(source, role, paintColor, wheelOpts.id);
           partMaterials.set(key, mat);
           ownedMaterials.add(mat);
           if (role === 'paint') paint ||= mat;
